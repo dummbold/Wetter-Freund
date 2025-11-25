@@ -24,6 +24,6 @@ What we don't offer:
 - NO Cloud at the end of the world collecting your data. YOUR data stays in YOUR home!
 - NO eye-burning dashboard - the software ist for admin use, but it still looks kind of nice.
 
-Start your journey in the (WIKI)[https://github.com/dummbold/Wetter-Freund/wiki]
+Start your journey in the (https://github.com/dummbold/Wetter-Freund/wiki)[WIKI]
 Please note the Information for different languages at the beginning of the HOME-Page.
 
