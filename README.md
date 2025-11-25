@@ -2,7 +2,7 @@
 DIY Weather station with ESP and Arduino. Build your own smart weather station with WebUI and a couple of cool functions for just a few bucks.
 
 Hardware:
-- ESP-02s (8285) - any 8266 schould work!
+- ESP-02s (8285) - any 8266 should work!
 - BME280 Sensor
 - Buck-Converter 5V/3,3V
 - LED flashlight (to avoid plane crashes ... ;-))
