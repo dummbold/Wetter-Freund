@@ -25,5 +25,6 @@ What we don't offer:
 - NO eye-burning dashboard - the software ist for admin use, but it still looks kind of nice.
 
 Start your journey in the [WIKI](https://github.com/dummbold/Wetter-Freund/wiki)
-Please note the Information for different languages at the beginning of the HOME-Page.
+
+This documentation is written in german language – please note the Information for different languages at the beginning of the HOME-Page.
 
