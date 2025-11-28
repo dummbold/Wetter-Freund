@@ -20,6 +20,27 @@
 //  - Logging-System (Weblog, Syslog, MQTT)
 //  - JSON-API
 //
+//  RECHTLICHER HINWEIS - LIZENZBESTIMMUNGEN
+//  
+//  Diese Software ist urheberrechtlich geschützt.
+//  Lizenz: CC BY-NC 4.0 International
+//  
+//  Nutze sie gerne für dein PRIVATES Projekt:
+//  • baue ein neues Interface
+//  • übersetze sie in deine Sprache
+//  • passe sie an einen anderen Prozessor an
+//  • ergänze oder lösche Funktionen
+//  
+//  Ohne schriftliche Genehmigung sind VERBOTEN:
+//  • Kommerzielle Nutzung jeglicher Art
+//  • Integration in kommerzielle Produkte oder Dienstleistungen
+//  • Weiterverkauf oder Lizenzierung an Dritte
+//  
+//  Verstöße werden konsequent rechtlich verfolgt.
+//  Schadensersatzforderungen vorbehalten.
+//  
+//  Lizenzanfragen: [m-post@online.de]
+//  
 //═══════════════════════════════════════════════════════════════════════════════
 
 
