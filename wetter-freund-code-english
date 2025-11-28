@@ -20,6 +20,30 @@
 //  - Logging system (Weblog, Syslog, MQTT)
 //  - JSON API
 //
+//  LEGAL NOTICE - LICENSE TERMS
+//  
+//  This software is protected by copyright.
+//  License: CC BY-NC 4.0 International
+//  
+//  Feel free to use it for your PRIVATE project:
+//  • build a new interface
+//  • translate it into your language
+//  • adapt it to another processor
+//  • add or remove features
+//  
+//  WITHOUT written permission the following is PROHIBITED:
+//  • Commercial use of any kind
+//  • Integration into commercial products or services
+//  • Resale or licensing to third parties
+//  
+//  Violations will be prosecuted to the fullest extent of the law.
+//  Claims for damages reserved.
+//  
+//  License inquiries: [m-post@online.de]
+//  
+//  NOTE: even though the GPT did the coding, there is still a lot of work and 
+//  time invested in this project (several weeks quasi full-time). Respect that!
+//
 //═══════════════════════════════════════════════════════════════════════════════
 
 
