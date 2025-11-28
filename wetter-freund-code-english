@@ -1,0 +1,1808 @@
+//═══════════════════════════════════════════════════════════════════════════════
+//
+//  WEATHER•FRIEND - ESP8266 Weather Sensor with BME280
+//
+//  Hardware: ESP-02S + BME280 (I2C)
+//  Programming: Roland Mainka
+//  Coding: DeutschlandGPT
+//  Repo: github.com/dummbold/Wetter-Freund
+//  Version: 1.0
+//  Date: November 2025
+//
+//  Features:
+//  - Measurement of temperature, humidity, air pressure
+//  - Calculation of dew point and barometer trend
+//  - Weather warnings (rain, snow, fog, ice)
+//  - Web interface with 4 tabs (Display, Settings, System, Log)
+//  - MQTT integration with Home Assistant Discovery
+//  - OTA updates (Over-The-Air)
+//  - NTP time server
+//  - Logging system (Weblog, Syslog, MQTT)
+//  - JSON API
+//
+//═══════════════════════════════════════════════════════════════════════════════
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// LIBRARIES
+//═══════════════════════════════════════════════════════════════════════════════
+
+#include <ESP8266WiFi.h>          // WiFi functionality
+#include <ESP8266WebServer.h>     // Web server
+#include <ArduinoOTA.h>           // Over-The-Air Updates
+#include <Wire.h>                 // I2C communication
+#include <Adafruit_Sensor.h>      // Adafruit Sensor library
+#include <Adafruit_BME280.h>      // BME280 Sensor
+#include <EEPROM.h>               // Persistent storage
+#include <PubSubClient.h>         // MQTT client
+#include <WiFiUdp.h>              // UDP for NTP
+#include <time.h>                 // Time functions
+#include <math.h>                 // Mathematical functions
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// HARDWARE CONFIGURATION
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// GPIO Pin Assignment
+//---------------------
+
+#define SDA_PIN 5        // I2C Data Pin (GPIO5)
+#define SCL_PIN 4        // I2C Clock Pin (GPIO4)
+#define BUTTON_PIN 12    // Reset button for AP mode (GPIO12)
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// ACCESS POINT CONFIGURATION
+//═══════════════════════════════════════════════════════════════════════════════
+
+// If no WiFi credentials are stored or the button is pressed,
+// the ESP starts its own access point with these settings
+
+const char* AP_SSID = "ESP-BME280-Sensor";       // Access point name
+const IPAddress AP_IP(192, 168, 4, 1);           // IP address in AP mode
+const IPAddress AP_GATEWAY(192, 168, 4, 1);      // Gateway in AP mode
+const IPAddress AP_SUBNET(255, 255, 255, 0);     // Subnet mask
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// LOCATION DEFAULT VALUES
+//═══════════════════════════════════════════════════════════════════════════════
+
+// These values are used when no location data is configured
+
+const float DEFAULT_ALT = 0.0f;           // Altitude above sea level in meters
+const char* DEFAULT_LAT = "0.0° N";       // Latitude
+const char* DEFAULT_LON = "0.0° E";       // Longitude
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// TIME AND NTP
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Weekdays (English)
+//---------------------
+
+const char* weekDays[] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+
+//---------------------
+// Setup NTP time server
+//---------------------
+
+// Configures the timezone (CET/CEST) and connects to NTP servers
+void setupTime() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);  // Central European Time with DST
+  tzset();
+}
+
+//---------------------
+// Formatted time output (English)
+//---------------------
+
+// Returns the current time in format "Monday, 28.11.2025 - 14:30:45"
+String getTimeString() {
+  time_t now = time(nullptr);
+  struct tm* tm_info = localtime(&now);
+  if (!tm_info) return String("Time unknown");
+  
+  char dateTime[64];
+  strftime(dateTime, sizeof(dateTime), "%d.%m.%Y - %H:%M:%S", tm_info);
+  
+  char buffer[96];
+  snprintf(buffer, sizeof(buffer), "%s, %s", weekDays[tm_info->tm_wday], dateTime);
+  
+  return String(buffer);
+}
+
+//---------------------
+// ISO 8601 timestamp
+//---------------------
+
+// Returns local time in ISO format (for JSON and MQTT)
+String utcTimeISO8601() {
+  time_t now = time(nullptr);
+  if (now <= 0) return String("1970-01-01T00:00:00Z");
+  
+  struct tm gt;
+  localtime_r(&now, &gt);
+  
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+           gt.tm_year + 1900, gt.tm_mon + 1, gt.tm_mday,
+           gt.tm_hour, gt.tm_min, gt.tm_sec);
+  
+  return String(buf);
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL OBJECTS
+//═══════════════════════════════════════════════════════════════════════════════
+
+Adafruit_BME280 bme;                    // BME280 sensor object
+ESP8266WebServer webServer(80);         // Web server on port 80
+WiFiClient netClient;                   // WiFi client for MQTT
+PubSubClient mqtt(netClient);           // MQTT client
+WiFiUDP udpClient;                      // UDP client for NTP
+
+bool apMode = false;                    // Flag: True when in AP mode
+float cpuUsage = 0.0;                   // CPU usage in percent
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// MQTT STATUS TRACKING
+//═══════════════════════════════════════════════════════════════════════════════
+
+// MQTT can have three states: Disconnected, Connecting, Connected
+enum MQTTConnectionStatus {
+  MQTT_STATUS_DISCONNECTED = 0,    // No connection
+  MQTT_STATUS_CONNECTING = 1,      // Connection attempt in progress
+  MQTT_STATUS_CONNECTED = 2        // Successfully connected
+};
+
+MQTTConnectionStatus mqttStatus = MQTT_STATUS_DISCONNECTED;
+String mqttLastError = "";                                      // Last error message
+unsigned long mqttLastConnectAttempt = 0;                       // Time of last attempt
+const unsigned long MQTT_RECONNECT_INTERVAL = 5000;             // Wait time between attempts (5 seconds)
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// BAROMETER - HOURLY VALUE LOGIC
+//═══════════════════════════════════════════════════════════════════════════════
+
+// The barometer calculates the air pressure trend over 2 hours
+// Hourly average values are formed for this purpose
+
+float pressureSum = 0.0f;          // Sum of pressure values in current hour
+int pressureCount = 0;             // Number of measurements in current hour
+int lastHour = -1;                 // Last saved hour
+
+float hourlyValue_minus1 = NAN;    // Average pressure 1 hour ago
+float hourlyValue_minus2 = NAN;    // Average pressure 2 hours ago
+float currentHourlyValue = NAN;    // Current hourly average
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// LOGGING SYSTEM
+//═══════════════════════════════════════════════════════════════════════════════
+
+#define LOG_BUFFER_SIZE 100        // Maximum number of log entries in RAM
+
+//---------------------
+// Log levels
+//---------------------
+
+enum LogLevel {
+  LOG_INFO = 0,     // Information
+  LOG_WARN = 1,     // Warnings
+  LOG_ERROR = 2     // Errors
+};
+
+//---------------------
+// Log entry structure
+//---------------------
+
+struct LogEntry {
+  time_t timestamp;
+  LogLevel level;
+  char message[128];
+};
+
+LogEntry logBuffer[LOG_BUFFER_SIZE];
+int logIndex = 0;
+int logCount = 0;
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION STRUCTURE
+//═══════════════════════════════════════════════════════════════════════════════
+
+#define EEPROM_SIZE 1024
+#define CONFIG_MAGIC 0xBEEF
+
+// All settings are stored in this structure
+struct Config {
+  uint16_t magic;              // Magic number for validity check
+  char ssid[33];               // WiFi SSID
+  char pass[65];               // WiFi password
+  char mqttBroker[64];         // MQTT broker address (IP:Port)
+  char mqttUser[32];           // MQTT username
+  char mqttPass[32];           // MQTT password
+  bool mqttActive;             // MQTT enabled
+  float altitude;              // Altitude above sea level
+  char latitude[16];           // Latitude
+  char longitude[16];          // Longitude
+  bool logWeblog;              // Web log enabled
+  bool logSyslog;              // Syslog enabled
+  bool logMqtt;                // MQTT log enabled
+  char syslogServer[64];       // Syslog server address
+  bool mqttSendTemp;           // Send temperature via MQTT
+  bool mqttSendHum;            // Send humidity via MQTT
+  bool mqttSendPress;          // Send pressure via MQTT
+  bool mqttSendBaro;           // Send barometer via MQTT
+  bool mqttSendDew;            // Send dew point via MQTT
+  bool mqttSendWarn;           // Send warning via MQTT
+  bool mqttRetainTemp;         // Retain temperature
+  bool mqttRetainHum;          // Retain humidity
+  bool mqttRetainPress;        // Retain pressure
+  bool mqttRetainBaro;         // Retain barometer
+  bool mqttRetainDew;          // Retain dew point
+  bool mqttRetainWarn;         // Retain warning
+};
+
+Config cfg;
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION FUNCTIONS
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Set default values
+//---------------------
+
+void cfgSetDefaults() {
+  cfg.magic = CONFIG_MAGIC;
+  memset(cfg.ssid, 0, sizeof(cfg.ssid));
+  memset(cfg.pass, 0, sizeof(cfg.pass));
+  memset(cfg.mqttBroker, 0, sizeof(cfg.mqttBroker));
+  memset(cfg.mqttUser, 0, sizeof(cfg.mqttUser));
+  memset(cfg.mqttPass, 0, sizeof(cfg.mqttPass));
+  cfg.mqttActive = false;
+  cfg.altitude = DEFAULT_ALT;
+  strcpy(cfg.latitude, DEFAULT_LAT);
+  strcpy(cfg.longitude, DEFAULT_LON);
+  cfg.logWeblog = true;
+  cfg.logSyslog = false;
+  cfg.logMqtt = false;
+  memset(cfg.syslogServer, 0, sizeof(cfg.syslogServer));
+  cfg.mqttSendTemp = true;
+  cfg.mqttSendHum = true;
+  cfg.mqttSendPress = true;
+  cfg.mqttSendBaro = true;
+  cfg.mqttSendDew = true;
+  cfg.mqttSendWarn = true;
+  cfg.mqttRetainTemp = false;
+  cfg.mqttRetainHum = false;
+  cfg.mqttRetainPress = false;
+  cfg.mqttRetainBaro = false;
+  cfg.mqttRetainDew = false;
+  cfg.mqttRetainWarn = false;
+}
+
+//---------------------
+// Save configuration
+//---------------------
+
+void cfgSave() {
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+}
+
+//---------------------
+// Load configuration
+//---------------------
+
+bool cfgLoad() {
+  EEPROM.get(0, cfg);
+  if (cfg.magic != CONFIG_MAGIC) {
+    return false;
+  }
+  return true;
+}
+
+//---------------------
+// Erase all EEPROM
+//---------------------
+
+void cfgEraseAll() {
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    EEPROM.write(i, 0xFF);
+  }
+  EEPROM.commit();
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// LOGGING FUNCTIONS
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Add log message
+//---------------------
+
+// Adds a message to the log buffer and distributes it to all active outputs
+void logMessage(LogLevel level, const char* message) {
+  // Add to web log buffer
+  if (cfg.logWeblog) {
+    LogEntry& entry = logBuffer[logIndex];
+    entry.timestamp = time(nullptr);
+    entry.level = level;
+    strncpy(entry.message, message, sizeof(entry.message) - 1);
+    entry.message[sizeof(entry.message) - 1] = '\0';
+    
+    logIndex = (logIndex + 1) % LOG_BUFFER_SIZE;
+    if (logCount < LOG_BUFFER_SIZE) logCount++;
+  }
+  
+  // Output to serial console
+  Serial.print("[");
+  switch(level) {
+    case LOG_INFO:  Serial.print("INFO");  break;
+    case LOG_WARN:  Serial.print("WARN");  break;
+    case LOG_ERROR: Serial.print("ERROR"); break;
+  }
+  Serial.print("] ");
+  Serial.println(message);
+  
+  // Send to syslog (if enabled)
+  if (cfg.logSyslog && cfg.syslogServer[0] != '\0') {
+    // Syslog implementation would go here
+  }
+  
+  // Send to MQTT (if enabled and connected)
+  if (cfg.logMqtt && mqtt.connected()) {
+    String topic = "bme280/log";
+    String payload = String(message);
+    mqtt.publish(topic.c_str(), payload.c_str());
+  }
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// WIFI FUNCTIONS
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Start AP mode
+//---------------------
+
+// Starts the ESP as an access point for initial configuration
+void startAPMode() {
+  apMode = true;
+  logMessage(LOG_INFO, "Starting AP mode...");
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+  WiFi.softAP(AP_SSID);
+  
+  Serial.println("AP mode active");
+  Serial.print("SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+  
+  logMessage(LOG_INFO, "AP mode active");
+}
+
+//---------------------
+// Connect to WiFi
+//---------------------
+
+// Attempts to connect to the configured WiFi network
+bool connectToWiFi() {
+  if (cfg.ssid[0] == '\0') {
+    logMessage(LOG_WARN, "No WiFi credentials configured");
+    return false;
+  }
+  
+  logMessage(LOG_INFO, "Connecting to WiFi...");
+  Serial.print("Connecting to: ");
+  Serial.println(cfg.ssid);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(cfg.ssid, cfg.pass);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected! IP: ");
+    Serial.println(WiFi.localIP());
+    logMessage(LOG_INFO, "WiFi connected");
+    return true;
+  } else {
+    logMessage(LOG_ERROR, "WiFi connection failed");
+    return false;
+  }
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// OTA UPDATE
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Setup OTA updates
+//---------------------
+
+// Configures Over-The-Air firmware updates
+void setupOTA() {
+  ArduinoOTA.setHostname("ESP-BME280");
+  
+  ArduinoOTA.onStart([]() {
+    logMessage(LOG_INFO, "OTA update started");
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    logMessage(LOG_INFO, "OTA update completed");
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    logMessage(LOG_ERROR, "OTA update failed");
+  });
+  
+  ArduinoOTA.begin();
+  logMessage(LOG_INFO, "OTA ready");
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// CPU USAGE MEASUREMENT
+//═══════════════════════════════════════════════════════════════════════════════
+
+unsigned long loopCounter = 0;
+unsigned long lastMeasurement = 0;
+
+//---------------------
+// Measure CPU usage
+//---------------------
+
+// Calculates CPU usage based on loop execution frequency
+void measureCPU() {
+  loopCounter++;
+  
+  unsigned long currentTime = millis();
+  if (currentTime - lastMeasurement >= 1000) {
+    float loopsPerSecond = loopCounter;
+    
+    // Approximately 50,000 loops/sec should be possible at idle
+    // Fewer loops means higher load
+    float maxLoops = 50000.0;
+    cpuUsage = 100.0 - ((loopsPerSecond / maxLoops) * 100.0);
+    
+    // Limit to 0-100%
+    if (cpuUsage < 0) cpuUsage = 0;
+    if (cpuUsage > 100) cpuUsage = 100;
+    
+    // Reset for next measurement
+    loopCounter = 0;
+    lastMeasurement = currentTime;
+  }
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// WEATHER CALCULATIONS
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Calculate dew point
+//---------------------
+
+// Calculates dew point from temperature and humidity
+// The dew point is the temperature at which air is saturated with water vapor
+float dewPoint(float temp, float hum) {
+  const float a = 17.62f;
+  const float b = 243.12f;
+  float gamma = log(hum / 100.0f) + (a * temp) / (b + temp);
+  return (b * gamma) / (a - gamma);
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// BAROMETER FUNCTIONS
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Update barometer
+//---------------------
+
+// Called every 5 seconds and collects pressure values
+// On hour change, the average of the last hour is saved
+void updateBarometer(float currentPressure) {
+  if (isnan(currentPressure)) return;
+  
+  time_t now = time(nullptr);
+  struct tm* tm_info = localtime(&now);
+  if (!tm_info) return;
+  int currentHour = tm_info->tm_hour;
+  
+  // Hour change detected
+  if (lastHour >= 0 && currentHour != lastHour) {
+    if (pressureCount > 0) {
+      float finishedHourValue = pressureSum / pressureCount;
+      hourlyValue_minus2 = hourlyValue_minus1;    // Value from 2 hours ago
+      hourlyValue_minus1 = finishedHourValue;     // Value from 1 hour ago
+    }
+    pressureSum = 0.0f;
+    pressureCount = 0;
+  }
+  
+  lastHour = currentHour;
+  pressureSum += currentPressure;
+  pressureCount++;
+  currentHourlyValue = pressureSum / pressureCount;
+}
+
+//---------------------
+// Barometer ready?
+//---------------------
+
+// Checks if enough data is available for trend calculation
+// At least 2 hours of data are required
+bool baroReady() {
+  return (!isnan(currentHourlyValue) && !isnan(hourlyValue_minus2));
+}
+
+//---------------------
+// Calculate barometer trend
+//---------------------
+
+// Calculates air pressure trend over 2 hours
+// Return: -3 (strongly falling) to +3 (strongly rising)
+int calcBaroTrend() {
+  if (!baroReady()) return 0;
+  
+  float diff = currentHourlyValue - hourlyValue_minus2;
+  
+  if (diff > 2.0f) return 3;      // Strongly rising
+  if (diff > 1.0f) return 2;      // Rising
+  if (diff > 0.5f) return 1;      // Slightly rising
+  if (diff < -2.0f) return -3;    // Strongly falling
+  if (diff < -1.0f) return -2;    // Falling
+  if (diff < -0.5f) return -1;    // Slightly falling
+  return 0;                       // Stable
+}
+
+//---------------------
+// Generate barometer icons
+//---------------------
+
+// Creates a visual representation of the barometer trend
+// With colored dots from ➖ (falling) to ➕ (rising)
+String baroIcons(int trend) {
+  if (trend < -3) trend = -3;
+  if (trend > 3)  trend =  3;
+  
+  const char* colored[7] = {"🔴","🟠","🟡","🔵","🟡","🟠","🔴"};
+  const char* gray = "⚪️";
+  const int center = 3;
+  const int active = center + trend;
+  
+  String out = "➖ ";
+  for (int i = 0; i < 7; i++) {
+    bool isCenter = (i == center);
+    bool isActive = (i == active);
+    if (isCenter || isActive) {
+      out += colored[i];
+    } else {
+      out += gray;
+    }
+    if (i < 6) out += " ";
+  }
+  out += " ➕";
+  return out;
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// WEATHER WARNING
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Calculate weather warning
+//---------------------
+
+// Analyzes weather data and issues a warning
+// Return: 0=none, 1=rain, 2=snow, 3=fog, 4=ice
+int calculateWeatherWarning(float temp, float hum, float dew, int baroTrend) {
+  // Ice danger: Temperature just above freezing + high humidity
+  if (temp >= -1.0f && temp <= 4.0f && hum > 75.0f) {
+    return 4; // ❄️ Ice
+  }
+  
+  // Snow: Temperature below 2°C + high humidity + falling pressure
+  if (temp < 2.0f && hum > 85.0f && baroTrend < 0) {
+    return 2; // 🌨️ Snow
+  }
+  
+  // Fog: Small difference between temperature and dew point
+  float tempDewDiff = temp - dew;
+  if (tempDewDiff < 2.5f && hum > 90.0f) {
+    return 3; // 🌫️ Fog
+  }
+  
+  // Rain: High humidity + falling pressure
+  if (hum > 85.0f && baroTrend < 0) {
+    return 1; // 🌧️ Rain
+  }
+  
+  return 0; // No warning
+}
+
+//---------------------
+// Warning icon
+//---------------------
+
+// Returns the appropriate emoji for the weather warning
+String getWarningIcon(int warning) {
+  switch(warning) {
+    case 1: return "🌧️";
+    case 2: return "🌨️";
+    case 3: return "🌫️";
+    case 4: return "❄️";
+    default: return "—";
+  }
+}
+
+//---------------------
+// Warning text
+//---------------------
+
+// Returns the plain text for the weather warning
+String getWarningText(int warning) {
+  switch(warning) {
+    case 1: return "Rain";
+    case 2: return "Snow";
+    case 3: return "Fog";
+    case 4: return "Ice";
+    default: return "None";
+  }
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// MQTT FUNCTIONS
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// MQTT error text
+//---------------------
+
+// Translates MQTT error codes into readable texts
+String getMQTTErrorText(int state) {
+  switch(state) {
+    case -4: return "Timeout";
+    case -3: return "Connection lost";
+    case -2: return "Connect failed";
+    case -1: return "Not connected";
+    case 0: return "Connected";
+    case 1: return "Wrong protocol";
+    case 2: return "Client ID rejected";
+    case 3: return "Server unavailable";
+    case 4: return "Login failed";
+    case 5: return "Not authorized";
+    default: return "Unknown error (" + String(state) + ")";
+  }
+}
+
+//---------------------
+// Connect MQTT
+//---------------------
+
+// Establishes connection to MQTT broker
+// Uses reconnect interval to avoid overloading the broker
+void connectMQTT() {
+  if (!cfg.mqttActive || cfg.mqttBroker[0] == '\0') {
+    mqttStatus = MQTT_STATUS_DISCONNECTED;
+    mqttLastError = "MQTT not configured";
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - mqttLastConnectAttempt < MQTT_RECONNECT_INTERVAL) {
+    return;
+  }
+  mqttLastConnectAttempt = now;
+
+  mqttStatus = MQTT_STATUS_CONNECTING;
+
+  // Parse broker address (IP:Port)
+  String brokerStr = String(cfg.mqttBroker);
+  int colonPos = brokerStr.indexOf(':');
+  String ip;
+  int port = 1883;
+
+  if (colonPos > 0) {
+    ip = brokerStr.substring(0, colonPos);
+    port = brokerStr.substring(colonPos + 1).toInt();
+  } else {
+    ip = brokerStr;
+  }
+
+  mqtt.setServer(ip.c_str(), port);
+
+  Serial.print("Connecting to MQTT broker: ");
+  Serial.print(ip);
+  Serial.print(":");
+  Serial.println(port);
+
+  // Generate client ID
+  String clientId = "ESP-BME280-" + String(ESP.getChipId(), HEX);
+
+  bool connected = false;
+  
+  // Connect with or without authentication
+  if (cfg.mqttUser[0] != '\0') {
+    connected = mqtt.connect(clientId.c_str(), cfg.mqttUser, cfg.mqttPass);
+  } else {
+    connected = mqtt.connect(clientId.c_str());
+  }
+
+  if (connected) {
+    mqttStatus = MQTT_STATUS_CONNECTED;
+    mqttLastError = "";
+    logMessage(LOG_INFO, "MQTT connected");
+    Serial.println("MQTT connected!");
+  } else {
+    mqttStatus = MQTT_STATUS_DISCONNECTED;
+    int state = mqtt.state();
+    mqttLastError = getMQTTErrorText(state);
+    logMessage(LOG_ERROR, ("MQTT error: " + mqttLastError).c_str());
+    Serial.print("MQTT connection failed: ");
+    Serial.println(mqttLastError);
+  }
+}
+
+//---------------------
+// Publish sensor data
+//---------------------
+
+// Sends all sensor data to MQTT topics
+void publishSensorData() {
+  if (!mqtt.connected()) return;
+  
+  float temp  = bme.readTemperature();
+  float hum   = bme.readHumidity();
+  float press = bme.readPressure() / 100.0f;
+  float dew   = dewPoint(temp, hum);
+  int trend   = calcBaroTrend();
+  int warning = calculateWeatherWarning(temp, hum, dew, trend);
+  
+  // Publish individual values (if enabled)
+  if (cfg.mqttSendTemp) {
+    mqtt.publish("bme280/temperature", String(temp, 2).c_str(), cfg.mqttRetainTemp);
+  }
+  
+  if (cfg.mqttSendHum) {
+    mqtt.publish("bme280/humidity", String(hum, 2).c_str(), cfg.mqttRetainHum);
+  }
+  
+  if (cfg.mqttSendPress) {
+    mqtt.publish("bme280/pressure", String(press, 2).c_str(), cfg.mqttRetainPress);
+  }
+  
+  if (cfg.mqttSendBaro) {
+    mqtt.publish("bme280/barometer", String(trend).c_str(), cfg.mqttRetainBaro);
+  }
+  
+  if (cfg.mqttSendDew) {
+    mqtt.publish("bme280/dewpoint", String(dew, 2).c_str(), cfg.mqttRetainDew);
+  }
+  
+  if (cfg.mqttSendWarn) {
+    mqtt.publish("bme280/warning", getWarningText(warning).c_str(), cfg.mqttRetainWarn);
+  }
+}
+
+//---------------------
+// Home Assistant Discovery
+//---------------------
+
+// Sends MQTT discovery messages for Home Assistant
+void publishHADiscovery() {
+  if (!mqtt.connected()) return;
+  
+  String deviceId = "esp_bme280_" + String(ESP.getChipId(), HEX);
+  
+  // Device information (common for all entities)
+  String deviceJson = "\"device\":{\"identifiers\":[\"" + deviceId + "\"],\"name\":\"Weather Friend\",\"model\":\"ESP-02S + BME280\",\"manufacturer\":\"DIY\"}";
+  
+  // Temperature
+  String tempConfig = "{\"name\":\"Temperature\","
+                     "\"state_topic\":\"bme280/temperature\","
+                     "\"unit_of_measurement\":\"°C\","
+                     "\"device_class\":\"temperature\","
+                     "\"unique_id\":\"" + deviceId + "_temp\","
+                     + deviceJson + "}";
+  mqtt.publish("homeassistant/sensor/bme280_temp/config", tempConfig.c_str(), true);
+
+  // Humidity
+  String humConfig = "{\"name\":\"Humidity\","
+                     "\"state_topic\":\"bme280/humidity\","
+                     "\"unit_of_measurement\":\"%\","
+                     "\"device_class\":\"humidity\","
+                     "\"unique_id\":\"" + deviceId + "_hum\","
+                     + deviceJson + "}";
+  mqtt.publish("homeassistant/sensor/bme280_hum/config", humConfig.c_str(), true);
+
+  // Pressure
+  String pressConfig = "{\"name\":\"Pressure\","
+                       "\"state_topic\":\"bme280/pressure\","
+                       "\"unit_of_measurement\":\"hPa\","
+                       "\"device_class\":\"pressure\","
+                       "\"unique_id\":\"" + deviceId + "_press\","
+                       + deviceJson + "}";
+  mqtt.publish("homeassistant/sensor/bme280_press/config", pressConfig.c_str(), true);
+
+  // Barometer
+  String baroConfig = "{\"name\":\"Barometer Trend\","
+                      "\"state_topic\":\"bme280/barometer\","
+                      "\"unique_id\":\"" + deviceId + "_baro\","
+                      + deviceJson + "}";
+  mqtt.publish("homeassistant/sensor/bme280_baro/config", baroConfig.c_str(), true);
+
+  // Dew point
+  String dewConfig = "{\"name\":\"Dew Point\","
+                     "\"state_topic\":\"bme280/dewpoint\","
+                     "\"unit_of_measurement\":\"°C\","
+                     "\"device_class\":\"temperature\","
+                     "\"unique_id\":\"" + deviceId + "_dew\","
+                     + deviceJson + "}";
+  mqtt.publish("homeassistant/sensor/bme280_dew/config", dewConfig.c_str(), true);
+
+  // Weather warning
+  String warnConfig = "{\"name\":\"Weather Warning\","
+                      "\"state_topic\":\"bme280/warning\","
+                      "\"unique_id\":\"" + deviceId + "_warn\","
+                      + deviceJson + "}";
+  mqtt.publish("homeassistant/sensor/bme280_warn/config", warnConfig.c_str(), true);
+
+  logMessage(LOG_INFO, "HAOS Discovery sent");
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// WEB SERVER - ACCESS POINT MODE
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// AP configuration page
+//---------------------
+
+// Shows a simple form for WiFi configuration in AP mode
+void handleAPConfig() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Weather•Friend Configuration</title>";
+  
+  // CSS styles
+  html += "<style>";
+  html += "body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#ccccff;}";
+  html += "h1{text-align:center;}";
+  html += "input[type='text'],input[type='password']{font-family:monospace;background:#f5f5f5;border:1px solid #ccc;padding:6px;border-radius:4px;}";
+  html += "input[type='submit']{background:#4CAF50;color:white;padding:8px 16px;border:none;border-radius:4px;cursor:pointer;}";
+  html += "input[type='submit']:hover{background:#45a049;}";
+  html += "</style></head><body>";
+  
+  // Form
+  html += "<h1>Weather•Friend</h1>";
+  html += "<h2>WiFi Connection</h2>";
+  html += "<form action='/save' method='POST'>";
+  html += "<label>WiFi SSID:</label><br>";
+  html += "<input type='text' name='ssid' maxlength='32' required><br><br>";
+  html += "<label>WiFi Password:</label><br>";
+  html += "<input type='text' name='password' maxlength='64'><br><br>";
+  html += "<input type='submit' value='Save and Restart'>";
+  html += "</form></body></html>";
+  
+  webServer.send(200, "text/html", html);
+}
+
+//---------------------
+// Save AP configuration
+//---------------------
+
+// Saves WiFi credentials and restarts the ESP
+void handleAPSave() {
+  if (webServer.hasArg("ssid")) {
+    String ssid = webServer.arg("ssid");
+    String password = webServer.hasArg("password") ? webServer.arg("password") : "";
+    
+    memset(cfg.ssid, 0, sizeof(cfg.ssid));
+    memset(cfg.pass, 0, sizeof(cfg.pass));
+    ssid.toCharArray(cfg.ssid, sizeof(cfg.ssid));
+    password.toCharArray(cfg.pass, sizeof(cfg.pass));
+    cfgSave();
+    
+    // Confirmation page with auto-reload
+    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+    html += "<meta http-equiv='refresh' content='5;url=/'>";
+    html += "<title>Saved</title>";
+    html += "<style>body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#ccccff;}h1{text-align:center;}</style>";
+    html += "</head><body>";
+    html += "<h1>Configuration saved!</h1>";
+    html += "<p style='text-align:center;'><em>Device restarting...</em></p>";
+    html += "</body></html>";
+    webServer.send(200, "text/html", html);
+    
+    delay(1000);
+    ESP.restart();
+  } else {
+    webServer.send(400, "text/html", "Error: No SSID provided!");
+  }
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// WEB SERVER - STATION MODE
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Main page (Display tab)
+//---------------------
+
+// Shows all sensor data in a clear table
+void handleRoot() {
+  // Read sensor data
+  float temp  = bme.readTemperature();
+  float hum   = bme.readHumidity();
+  float press = bme.readPressure() / 100.0f;
+  float dew   = dewPoint(temp, hum);
+
+  // Calculate barometer and weather warning
+  updateBarometer(press);
+  int trend   = calcBaroTrend();
+  int warning = calculateWeatherWarning(temp, hum, dew, trend);
+
+  String baroIconsStr = baroIcons(trend);
+  String warnIcon     = getWarningIcon(warning);
+
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='5'>";  // Auto-reload every 5 seconds
+  html += "<title>Weather•Friend</title>";
+  
+  // CSS styles
+  html += "<style>";
+  html += "body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#ccccff;}";
+  html += "h1,h2,p{text-align:center;}";
+  html += ".tabs{text-align:center;margin-bottom:-1px;}";
+  html += ".tabs a{display:inline-block;margin-right:12px;padding:8px 14px;border:1px solid #999;text-decoration:none;color:#333;border-bottom:none;border-radius:6px 6px 0 0;background:#e8e8cc;font-size:20px;}";
+  html += ".tabs a.active{background:#fff;font-weight:bold;border-color:#666;}";
+  html += ".tabwrap{border:2px solid #999;padding:15px;border-radius:0 6px 6px 6px;max-width:700px;margin:0 auto;background:#fff;box-shadow:2px 2px 8px rgba(0,0,0,0.1);}";
+  html += "table{border-collapse:collapse;width:100%;max-width:500px;margin:0 auto;}";
+  html += "th,td{border:1px solid #999;padding:10px;text-align:left;}";
+  html += "th{background:#e8e8cc;font-weight:bold;}";
+  html += "td{background:#fafafa;}";
+  html += "</style></head><body>";
+
+  // Header
+  html += "<h1>Weather•Friend</h1>";
+  html += "<h2>ESP-02S | BME280</h2>";
+  html += "<p><b>" + getTimeString() + "</b></p>";
+
+  // Tab navigation
+  html += "<div class='tabs'>";
+  html += "<a href='/' class='active'>🌡️</a>";
+  html += "<a href='/mqtt'>⚙️</a>";
+  html += "<a href='/system'>📊</a>";
+  html += "<a href='/log'>🗒️</a>";
+  html += "</div><div class='tabwrap'>";
+
+  // Sensor data table
+  html += "<table>";
+  html += "<tr><th>Parameter</th><th>Value</th></tr>";
+  html += "<tr><td>Temperature</td><td>" + String(temp, 2) + " °C</td></tr>";
+  html += "<tr><td>Humidity</td><td>" + String(hum, 2) + " %</td></tr>";
+  html += "<tr><td>Pressure</td><td>" + String(press, 2) + " hPa</td></tr>";
+  html += "<tr><td>Barometer</td><td style='font-size:0.5em;'>" + baroIconsStr + "</td></tr>";
+  html += "<tr><td>Dew Point</td><td>" + String(dew, 2) + " °C</td></tr>";
+  html += "<tr><td>Warning</td><td style='font-size:1.5em;'>" + warnIcon + "</td></tr>";
+  
+  // Location data (if configured)
+  if (cfg.altitude != 0.0f || cfg.latitude[0] != '\0') {
+    html += "<tr><td>Altitude</td><td>" + String(cfg.altitude, 1) + " m</td></tr>";
+    html += "<tr><td>Latitude</td><td>" + String(cfg.latitude) + "</td></tr>";
+    html += "<tr><td>Longitude</td><td>" + String(cfg.longitude) + "</td></tr>";
+  }
+  
+  html += "</table>";
+
+  html += "<p><small><em>Auto-reload every 5 seconds</em></small></p>";
+  html += "</div></body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+//---------------------
+// Settings page (MQTT tab)
+//---------------------
+
+// Configuration page for WiFi, MQTT, location and logging
+void handleMQTTPage() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Weather•Friend</title>";
+  
+  // CSS styles
+  html += "<style>";
+  html += "body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#ccccff;}";
+  html += "h1,h2,p{text-align:center;}";
+  html += ".tabs{text-align:center;margin-bottom:-1px;}";
+  html += ".tabs a{display:inline-block;margin-right:12px;padding:8px 14px;border:1px solid #999;text-decoration:none;color:#333;border-bottom:none;border-radius:6px 6px 0 0;background:#e8e8cc;font-size:20px;}";
+  html += ".tabs a.active{background:#fff;font-weight:bold;border-color:#666;}";
+  html += ".tabwrap{border:2px solid #999;padding:15px;border-radius:0 6px 6px 6px;max-width:800px;margin:0 auto;background:#fff;box-shadow:2px 2px 8px rgba(0,0,0,0.1);}";
+  html += "label{display:block;margin:8px 0}";
+  html += "input[type='text'],input[type='number'],input[type='password']{width:280px;font-family:monospace;background:#f5f5f5;border:1px solid #ccc;padding:6px;border-radius:4px;}";
+  html += "input[type='submit']{background:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;font-size:14px;}";
+  html += "input[type='submit']:hover{background:#45a049;}";
+  html += "fieldset{margin:10px 0;padding:12px;border:1px solid #999;border-radius:6px;background:#fafafa;}";
+  html += "legend{padding:0 8px;font-weight:bold;color:#333;}";
+  html += ".mqtt-table{border-collapse:collapse;width:100%;margin:10px 0;}";
+  html += ".mqtt-table th,.mqtt-table td{border:1px solid #999;padding:8px;text-align:center;}";
+  html += ".mqtt-table th{background:#e8e8cc;font-weight:bold;}";
+  html += ".mqtt-table td:first-child{text-align:left;}";
+  html += ".mqtt-table td{background:#fafafa;}";
+  html += ".mqtt-status-inline{display:inline-block;padding:4px 10px;border-radius:12px;font-size:11px;margin-left:8px;font-weight:normal;}";
+  html += ".status-connected{background:#d4edda;color:#155724;}";
+  html += ".status-disconnected{background:#f8d7da;color:#721c24;}";
+  html += ".status-connecting{background:#fff3cd;color:#856404;}";
+  html += ".status-disabled{background:#e2e3e5;color:#383d41;}";
+  html += "</style>";
+  
+  // JavaScript for checkbox control and MQTT status polling
+  html += "<script>";
+  
+  // Function: Enable/disable retain checkbox
+  html += "function toggleRetain(idx){";
+  html += "  var sendBox=document.getElementById('send'+idx);";
+  html += "  var retBox=document.getElementById('ret'+idx);";
+  html += "  if(!sendBox.checked){retBox.checked=false;retBox.disabled=true;}";
+  html += "  else{retBox.disabled=false;}";
+  html += "}";
+  
+  // Function: Poll MQTT status
+  html += "function updateMQTTStatus(){";
+  html += "  fetch('/api/mqtt-status').then(r=>r.json()).then(d=>{";
+  html += "    var statusSpan=document.getElementById('mqttStatusBadge');";
+  html += "    if(!d.active){statusSpan.className='mqtt-status-inline status-disabled';statusSpan.textContent='Disabled';return;}";
+  html += "    if(d.status===2){statusSpan.className='mqtt-status-inline status-connected';statusSpan.textContent='Connected';}";
+  html += "    else if(d.status===1){statusSpan.className='mqtt-status-inline status-connecting';statusSpan.textContent='Connecting...';}";
+  html += "    else{statusSpan.className='mqtt-status-inline status-disconnected';statusSpan.textContent='Disconnected';}";
+  html += "  }).catch(e=>console.error(e));";
+  html += "}";
+  html += "setInterval(updateMQTTStatus,2000);";  // Poll every 2 seconds
+  html += "window.onload=updateMQTTStatus;";
+  html += "</script></head><body>";
+
+  // Header
+  html += "<h1>Weather•Friend</h1>";
+  html += "<h2>ESP-02S | BME280</h2>";
+  html += "<p><b>" + getTimeString() + "</b></p>";
+
+  // Tab navigation
+  html += "<div class='tabs'>";
+  html += "<a href='/'>🌡️</a>";
+  html += "<a href='/mqtt' class='active'>⚙️</a>";
+  html += "<a href='/system'>📊</a>";
+  html += "<a href='/log'>🗒️</a>";
+  html += "</div><div class='tabwrap'>";
+
+  // WiFi settings
+  html += "<form action='/saveWifi' method='POST'>";
+  html += "<fieldset><legend>WiFi Settings</legend>";
+  html += "<label>SSID:</label>";
+  html += "<input type='text' name='ssid' value='" + String(cfg.ssid) + "' maxlength='32' required><br>";
+  html += "<label>Password:</label>";
+  html += "<input type='password' name='password' value='" + String(cfg.pass) + "' maxlength='64'><br><br>";
+  html += "<input type='submit' value='Save WiFi'>";
+  html += "</fieldset></form>";
+
+  // MQTT settings with live status
+  html += "<form action='/saveMqtt' method='POST'>";
+  html += "<fieldset><legend>MQTT Settings <span id='mqttStatusBadge' class='mqtt-status-inline status-disconnected'>Disconnected</span></legend>";
+  html += "<label><input type='checkbox' name='mqttActive' value='1' " + String(cfg.mqttActive ? "checked" : "") + "> Enable MQTT</label><br>";
+  html += "<label>Broker (IP:Port):</label>";
+  html += "<input type='text' name='mqttBroker' value='" + String(cfg.mqttBroker) + "' maxlength='63' placeholder='192.168.1.100:1883'><br>";
+  html += "<label>Username:</label>";
+  html += "<input type='text' name='mqttUser' value='" + String(cfg.mqttUser) + "' maxlength='31'><br>";
+  html += "<label>Password:</label>";
+  html += "<input type='password' name='mqttPass' value='" + String(cfg.mqttPass) + "' maxlength='31'><br><br>";
+  
+  // MQTT topics table
+  html += "<table class='mqtt-table'>";
+  html += "<tr><th>Topic</th><th>Send</th><th>Retain</th></tr>";
+  
+  // Temperature
+  html += "<tr><td>Temperature</td>";
+  html += "<td><input type='checkbox' id='send0' name='mqttSendTemp' value='1' onchange='toggleRetain(0)' " + String(cfg.mqttSendTemp ? "checked" : "") + "></td>";
+  html += "<td><input type='checkbox' id='ret0' name='mqttRetainTemp' value='1' " + String(cfg.mqttRetainTemp ? "checked" : "") + " " + String(cfg.mqttSendTemp ? "" : "disabled") + "></td></tr>";
+  
+  // Humidity
+  html += "<tr><td>Humidity</td>";
+  html += "<td><input type='checkbox' id='send1' name='mqttSendHum' value='1' onchange='toggleRetain(1)' " + String(cfg.mqttSendHum ? "checked" : "") + "></td>";
+  html += "<td><input type='checkbox' id='ret1' name='mqttRetainHum' value='1' " + String(cfg.mqttRetainHum ? "checked" : "") + " " + String(cfg.mqttSendHum ? "" : "disabled") + "></td></tr>";
+  
+  // Pressure
+  html += "<tr><td>Pressure</td>";
+  html += "<td><input type='checkbox' id='send2' name='mqttSendPress' value='1' onchange='toggleRetain(2)' " + String(cfg.mqttSendPress ? "checked" : "") + "></td>";
+  html += "<td><input type='checkbox' id='ret2' name='mqttRetainPress' value='1' " + String(cfg.mqttRetainPress ? "checked" : "") + " " + String(cfg.mqttSendPress ? "" : "disabled") + "></td></tr>";
+  
+  // Barometer
+  html += "<tr><td>Barometer</td>";
+  html += "<td><input type='checkbox' id='send3' name='mqttSendBaro' value='1' onchange='toggleRetain(3)' " + String(cfg.mqttSendBaro ? "checked" : "") + "></td>";
+  html += "<td><input type='checkbox' id='ret3' name='mqttRetainBaro' value='1' " + String(cfg.mqttRetainBaro ? "checked" : "") + " " + String(cfg.mqttSendBaro ? "" : "disabled") + "></td></tr>";
+  
+  // Dew point
+  html += "<tr><td>Dew Point</td>";
+  html += "<td><input type='checkbox' id='send4' name='mqttSendDew' value='1' onchange='toggleRetain(4)' " + String(cfg.mqttSendDew ? "checked" : "") + "></td>";
+  html += "<td><input type='checkbox' id='ret4' name='mqttRetainDew' value='1' " + String(cfg.mqttRetainDew ? "checked" : "") + " " + String(cfg.mqttSendDew ? "" : "disabled") + "></td></tr>";
+  
+  // Warning
+  html += "<tr><td>Warning</td>";
+  html += "<td><input type='checkbox' id='send5' name='mqttSendWarn' value='1' onchange='toggleRetain(5)' " + String(cfg.mqttSendWarn ? "checked" : "") + "></td>";
+  html += "<td><input type='checkbox' id='ret5' name='mqttRetainWarn' value='1' " + String(cfg.mqttRetainWarn ? "checked" : "") + " " + String(cfg.mqttSendWarn ? "" : "disabled") + "></td></tr>";
+  
+  html += "</table><br>";
+  html += "<input type='submit' value='Save MQTT'>";
+  html += "</fieldset></form>";
+
+  // Location settings
+  html += "<form action='/saveLocation' method='POST'>";
+  html += "<fieldset><legend>Location</legend>";
+  html += "<label>Altitude (m):</label>";
+  html += "<input type='number' step='0.1' name='altitude' value='" + String(cfg.altitude, 1) + "'><br>";
+  html += "<label>Latitude:</label>";
+  html += "<input type='text' name='latitude' value='" + String(cfg.latitude) + "' maxlength='15' placeholder='50.5° N'><br>";
+  html += "<label>Longitude:</label>";
+  html += "<input type='text' name='longitude' value='" + String(cfg.longitude) + "' maxlength='15' placeholder='8.5° E'><br><br>";
+  html += "<input type='submit' value='Save Location'>";
+  html += "</fieldset></form>";
+
+  // Logging settings
+  html += "<form action='/saveLogging' method='POST'>";
+  html += "<fieldset><legend>Logging</legend>";
+  html += "<label><input type='checkbox' name='logWeblog' value='1' " + String(cfg.logWeblog ? "checked" : "") + "> Web Log</label><br>";
+  html += "<label><input type='checkbox' name='logSyslog' value='1' " + String(cfg.logSyslog ? "checked" : "") + "> Syslog</label><br>";
+  html += "<label>Syslog Server:</label>";
+  html += "<input type='text' name='syslogServer' value='" + String(cfg.syslogServer) + "' maxlength='63' placeholder='192.168.1.10:514'><br>";
+  html += "<label><input type='checkbox' name='logMqtt' value='1' " + String(cfg.logMqtt ? "checked" : "") + "> MQTT Log</label><br><br>";
+  html += "<input type='submit' value='Save Logging'>";
+  html += "</fieldset></form>";
+
+  html += "</div></body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+//---------------------
+// System page (System tab)
+//---------------------
+
+// Shows system information and provides OTA update and reset functions
+void handleSystemPage() {
+  // System information
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t usedHeap = 81920 - freeHeap;
+  uint32_t sketchSize = ESP.getSketchSize();
+  uint32_t freeSketch = ESP.getFreeSketchSpace();
+  uint32_t totalSketch = sketchSize + freeSketch;
+  String chipId = String(ESP.getChipId(), HEX);
+  chipId.toUpperCase();
+  String ipAddr = WiFi.localIP().toString();
+  String macAddr = WiFi.macAddress();
+  unsigned long uptime = millis() / 1000;
+  unsigned long days = uptime / 86400;
+  unsigned long hours = (uptime % 86400) / 3600;
+  unsigned long minutes = (uptime % 3600) / 60;
+  unsigned long seconds = uptime % 60;
+  String uptimeStr = String(days) + "d " + String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s";
+  
+  // Format memory values
+  String ramUsedKB   = String(usedHeap / 1024) + " kB";
+  String ramFreeKB   = String(freeHeap / 1024) + " kB";
+  String ramTotalKB  = "80 kB";
+  String flashUsedKB = String(sketchSize / 1024) + " kB";
+  String flashFreeKB = String(freeSketch / 1024) + " kB";
+  String flashTotalMB = String(totalSketch / 1048576.0f, 1) + " MB";
+
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Weather•Friend</title>";
+  
+  // CSS styles
+  html += "<style>";
+  html += "body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#ccccff;}";
+  html += "h1,h2,p{text-align:center;}";
+  html += ".tabs{text-align:center;margin-bottom:-1px;}";
+  html += ".tabs a{display:inline-block;margin-right:12px;padding:8px 14px;border:1px solid #999;text-decoration:none;color:#333;border-bottom:none;border-radius:6px 6px 0 0;background:#e8e8cc;font-size:20px;}";
+  html += ".tabs a.active{background:#fff;font-weight:bold;border-color:#666;}";
+  html += ".tabwrap{border:2px solid #999;padding:15px;border-radius:0 6px 6px 6px;max-width:700px;margin:0 auto;background:#fff;box-shadow:2px 2px 8px rgba(0,0,0,0.1);}";
+  html += "table{border-collapse:collapse;width:100%;max-width:640px;margin:0 auto;}";
+  html += "th,td{border:1px solid #999;padding:10px;text-align:left;}";
+  html += "th{background:#e8e8cc;font-weight:bold;}";
+  html += "td{background:#fafafa;}";
+  html += "fieldset{margin:20px auto;padding:15px;border:2px solid #999;border-radius:6px;max-width:640px;}";
+  html += "legend{font-weight:bold;padding:0 8px;color:#333;}";
+  html += "button{padding:10px 20px;font-size:14px;cursor:pointer;border:1px solid #999;border-radius:4px;background:#4CAF50;color:#fff;}";
+  html += "button:hover{background:#45a049;}";
+  html += "button.danger{background:#F44336;}";
+  html += "button.danger:hover{background:#da190b;}";
+  html += "input[type='file']{padding:8px;font-size:14px;border:1px solid #999;border-radius:4px;background:#f9f9f9;cursor:pointer;width:100%;max-width:400px;box-sizing:border-box;}";
+  html += ".warning-box{background:#FFF3CD;border:1px solid #FFC107;padding:10px;border-radius:4px;margin-bottom:10px;color:#856404;}";
+  html += ".upload-progress{margin-top:10px;color:#2196F3;}";
+  html += ".upload-success{margin-top:10px;color:#4CAF50;}";
+  html += ".upload-error{margin-top:10px;color:#F44336;font-weight:bold;}";
+  
+  // Progress bar for OTA upload
+  html += ".progwrap{width:100%;max-width:400px;height:14px;background:#eee;border:1px solid #bbb;border-radius:4px;position:relative;overflow:hidden;margin-top:8px;}";
+  html += ".progbar{height:100%;width:0%;background:#2196F3;transition:width 0.1s linear;}";
+  html += ".proglabel{position:absolute;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:12px;color:#222;font-weight:bold;}";
+  html += "</style>";
+
+  // JavaScript for OTA upload and EEPROM reset
+  html += "<script>";
+  
+  // Function: Firmware upload with progress bar
+  html += "function uploadFirmware(){var f=document.getElementById('firmware');var s=document.getElementById('uploadStatus');var pw=document.getElementById('progwrap');var pb=document.getElementById('progbar');var pl=document.getElementById('proglabel');";
+  html += "if(!f.files.length){s.className='upload-error';s.innerHTML='❌ Please select a .bin file!';return;}";
+  html += "var file=f.files[0];if(!file.name.endsWith('.bin')){s.className='upload-error';s.innerHTML='❌ Only .bin files allowed!';return;}";
+  html += "s.className='upload-progress';s.innerHTML='Upload in progress...';pb.style.width='0%';pl.textContent='0%';pw.style.display='block';";
+  html += "var fd=new FormData();fd.append('firmware',file);var x=new XMLHttpRequest();";
+  
+  // Show upload progress
+  html += "x.upload.addEventListener('progress',function(e){if(e.lengthComputable){var p=Math.round((e.loaded/e.total)*100);pb.style.width=p+'%';pl.textContent=p+'%';}});";
+  
+  // Upload complete
+  html += "x.addEventListener('load',function(){if(x.status===200){s.className='upload-success';s.innerHTML='✅ Upload successful! Device restarting...';setTimeout(function(){window.location.href='/';},8000);}else{s.className='upload-error';s.innerHTML='❌ Upload failed: '+x.responseText;}});";
+  
+  // Upload error
+  html += "x.addEventListener('error',function(){s.className='upload-error';s.innerHTML='❌ Network error during upload!';});";
+  
+  html += "x.open('POST','/update',true);x.send(fd);}";
+  
+  // Function: EEPROM reset with confirmation
+  html += "function eraseEEPROM(){if(confirm('⚠️ CAUTION: This will delete all settings!\\n\\nThe sensor will restart in AP mode and must be reconfigured.\\n\\nContinue?')){fetch('/eraseConfig').then(r=>r.text()).then(t=>{alert('Settings deleted. Device restarting...');setTimeout(function(){window.location.href='/';},3000);}).catch(e=>alert('Error: '+e));}}";
+  
+  html += "</script></head><body>";
+
+  // Header
+  html += "<h1>Weather•Friend</h1>";
+  html += "<h2>ESP-02S | BME280</h2>";
+  html += "<p><b>" + getTimeString() + "</b></p>";
+
+  // Tab navigation
+  html += "<div class='tabs'>";
+  html += "<a href='/'>🌡️</a>";
+  html += "<a href='/mqtt'>⚙️</a>";
+  html += "<a href='/system' class='active'>📊</a>";
+  html += "<a href='/log'>🗒️</a>";
+  html += "</div><div class='tabwrap'>";
+
+  // System information table
+  html += "<h3 style='text-align:center;'>System Information</h3>";
+  html += "<table>";
+  html += "<tr><th>Parameter</th><th>Value</th></tr>";
+  html += "<tr><td>Chip ID</td><td>" + chipId + "</td></tr>";
+  html += "<tr><td>IP Address</td><td>" + ipAddr + "</td></tr>";
+  html += "<tr><td>MAC Address</td><td>" + macAddr + "</td></tr>";
+  html += "<tr><td>Uptime</td><td>" + uptimeStr + "</td></tr>";
+  html += "<tr><td>CPU Usage</td><td>" + String(cpuUsage, 1) + " %</td></tr>";
+  html += "<tr><td>RAM Used</td><td>" + ramUsedKB + "</td></tr>";
+  html += "<tr><td>RAM Free</td><td>" + ramFreeKB + "</td></tr>";
+  html += "<tr><td>RAM Total</td><td>" + ramTotalKB + "</td></tr>";
+  html += "<tr><td>Flash Used</td><td>" + flashUsedKB + "</td></tr>";
+  html += "<tr><td>Flash Free</td><td>" + flashFreeKB + "</td></tr>";
+  html += "<tr><td>Flash Total</td><td>" + flashTotalMB + "</td></tr>";
+  html += "</table>";
+
+  // OTA Update section
+  html += "<fieldset>";
+  html += "<legend>Firmware Update (OTA)</legend>";
+  html += "<input type='file' id='firmware' accept='.bin'><br>";
+  html += "<div id='progwrap' class='progwrap' style='display:none;'><div id='progbar' class='progbar'></div><div id='proglabel' class='proglabel'>0%</div></div>";
+  html += "<div id='uploadStatus'></div><br>";
+  html += "<button onclick='uploadFirmware()'>Upload Firmware</button>";
+  html += "</fieldset>";
+
+  // System RESET section
+  html += "<fieldset>";
+  html += "<legend>System RESET</legend>";
+  html += "<div class='warning-box'>";
+  html += "<b>⚠️ CAUTION:</b> This action will permanently delete all saved settings!<br>";
+  html += "The sensor will restart in AP mode and must be completely reconfigured.";
+  html += "</div>";
+  html += "<button class='danger' onclick='eraseEEPROM()'>R E S E T</button>";
+  html += "</fieldset>";
+
+  html += "</div></body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+//---------------------
+// Log page (Log tab)
+//---------------------
+
+// Shows the last 100 log entries (newest first)
+void handleLogPage() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='5'>";  // Auto-reload every 5 seconds
+  html += "<title>Weather•Friend</title>";
+  
+  // CSS styles
+  html += "<style>";
+  html += "body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#ccccff;}";
+  html += "h1,h2,p{text-align:center;}";
+  html += ".tabs{text-align:center;margin-bottom:-1px;}";
+  html += ".tabs a{display:inline-block;margin-right:12px;padding:8px 14px;border:1px solid #999;text-decoration:none;color:#333;border-bottom:none;border-radius:6px 6px 0 0;background:#e8e8cc;font-size:20px;}";
+  html += ".tabs a.active{background:#fff;font-weight:bold;border-color:#666;}";
+  html += ".tabwrap{border:2px solid #999;padding:15px;border-radius:0 6px 6px 6px;max-width:900px;margin:0 auto;background:#fff;box-shadow:2px 2px 8px rgba(0,0,0,0.1);}";
+  html += "table{border-collapse:collapse;width:100%;margin:20px 0;font-family:'Courier New',monospace;font-size:13px;}";
+  html += "th,td{border:1px solid #999;padding:8px 12px;text-align:left;}";
+  html += "th{background:#e8e8cc;font-weight:bold;position:sticky;top:0;}";
+  html += "td{background:#fafafa;}";
+  html += ".log-info{color:#0066cc;font-weight:bold;}";
+  html += ".log-warn{color:#ff8800;font-weight:bold;}";
+  html += ".log-error{color:#cc0000;font-weight:bold;}";
+  html += ".timestamp{color:#666;font-size:12px;}";
+  html += ".footer{text-align:center;color:#666;font-size:11px;margin-top:20px;}";
+  html += "</style></head><body>";
+
+  // Header
+  html += "<h1>Weather•Friend</h1>";
+  html += "<h2>ESP-02S | BME280</h2>";
+  html += "<p><b>" + getTimeString() + "</b></p>";
+
+  // Tab navigation
+  html += "<div class='tabs'>";
+  html += "<a href='/'>🌡️</a>";
+  html += "<a href='/mqtt'>⚙️</a>";
+  html += "<a href='/system'>📊</a>";
+  html += "<a href='/log' class='active'>🗒️</a>";
+  html += "</div><div class='tabwrap'>";
+
+  // Check if weblog is enabled
+  if (!cfg.logWeblog) {
+    html += "<p style='text-align:center;color:#cc0000;margin:40px 0;'><b>[WEBLOG DISABLED]</b></p>";
+    html += "<p style='text-align:center;color:#666;'>Please enable in settings.</p>";
+  } else {
+    // Log table
+    html += "<table>";
+    html += "<tr><th>TIMESTAMP</th><th>LEVEL</th><th>MESSAGE</th></tr>";
+
+    // Output log entries in reverse (newest first)
+    for (int i = 0; i < logCount; i++) {
+      int idx = (logIndex - 1 - i + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
+      LogEntry& entry = logBuffer[idx];
+      
+      // Format timestamp
+      time_t t = entry.timestamp;
+      struct tm* tm_info = localtime(&t);
+      char timeStr[20];
+      if (tm_info) {
+        strftime(timeStr, sizeof(timeStr), "%d.%m. %H:%M:%S", tm_info);
+      } else {
+        strcpy(timeStr, "??:??:??");
+      }
+      
+      // Format log level
+      const char* levelStr[] = {"INFO", "WARN", "ERROR"};
+      const char* levelClass[] = {"log-info", "log-warn", "log-error"};
+      
+      // Output table row
+      html += "<tr>";
+      html += "<td class='timestamp'>" + String(timeStr) + "</td>";
+      html += "<td class='" + String(levelClass[entry.level]) + "'>" + String(levelStr[entry.level]) + "</td>";
+      html += "<td>" + String(entry.message) + "</td>";
+      html += "</tr>";
+    }
+
+    html += "</table>";
+    html += "<p class='footer'>Total entries: " + String(logCount) + " / " + String(LOG_BUFFER_SIZE) + "</p>";
+  }
+
+  html += "</div></body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION HANDLERS
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Save WiFi settings
+//---------------------
+
+void handleSaveWifi() {
+  if (webServer.hasArg("ssid")) {
+    String ssid = webServer.arg("ssid");
+    String password = webServer.hasArg("password") ? webServer.arg("password") : "";
+    
+    memset(cfg.ssid, 0, sizeof(cfg.ssid));
+    memset(cfg.pass, 0, sizeof(cfg.pass));
+    ssid.toCharArray(cfg.ssid, sizeof(cfg.ssid));
+    password.toCharArray(cfg.pass, sizeof(cfg.pass));
+    cfgSave();
+    
+    logMessage(LOG_INFO, "WiFi settings saved");
+    webServer.sendHeader("Location", "/mqtt");
+    webServer.send(303);
+  } else {
+    webServer.send(400, "text/plain", "Error: Missing parameters!");
+  }
+}
+
+//---------------------
+// Save MQTT settings
+//---------------------
+
+void handleSaveMqtt() {
+  cfg.mqttActive = webServer.hasArg("mqttActive");
+  
+  if (webServer.hasArg("mqttBroker")) {
+    String broker = webServer.arg("mqttBroker");
+    memset(cfg.mqttBroker, 0, sizeof(cfg.mqttBroker));
+    broker.toCharArray(cfg.mqttBroker, sizeof(cfg.mqttBroker));
+  }
+  
+  if (webServer.hasArg("mqttUser")) {
+    String user = webServer.arg("mqttUser");
+    memset(cfg.mqttUser, 0, sizeof(cfg.mqttUser));
+    user.toCharArray(cfg.mqttUser, sizeof(cfg.mqttUser));
+  }
+  
+  if (webServer.hasArg("mqttPass")) {
+    String pass = webServer.arg("mqttPass");
+    memset(cfg.mqttPass, 0, sizeof(cfg.mqttPass));
+    pass.toCharArray(cfg.mqttPass, sizeof(cfg.mqttPass));
+  }
+  
+  // Save topic settings
+  cfg.mqttSendTemp = webServer.hasArg("mqttSendTemp");
+  cfg.mqttSendHum = webServer.hasArg("mqttSendHum");
+  cfg.mqttSendPress = webServer.hasArg("mqttSendPress");
+  cfg.mqttSendBaro = webServer.hasArg("mqttSendBaro");
+  cfg.mqttSendDew = webServer.hasArg("mqttSendDew");
+  cfg.mqttSendWarn = webServer.hasArg("mqttSendWarn");
+  
+  cfg.mqttRetainTemp = webServer.hasArg("mqttRetainTemp");
+  cfg.mqttRetainHum = webServer.hasArg("mqttRetainHum");
+  cfg.mqttRetainPress = webServer.hasArg("mqttRetainPress");
+  cfg.mqttRetainBaro = webServer.hasArg("mqttRetainBaro");
+  cfg.mqttRetainDew = webServer.hasArg("mqttRetainDew");
+  cfg.mqttRetainWarn = webServer.hasArg("mqttRetainWarn");
+  
+  cfgSave();
+  logMessage(LOG_INFO, "MQTT settings saved");
+  
+  // Reconnect MQTT
+  if (cfg.mqttActive) {
+    mqtt.disconnect();
+    mqttStatus = MQTT_STATUS_DISCONNECTED;
+    connectMQTT();
+  }
+  
+  webServer.sendHeader("Location", "/mqtt");
+  webServer.send(303);
+}
+
+//---------------------
+// Save location settings
+//---------------------
+
+void handleSaveLocation() {
+  if (webServer.hasArg("altitude")) {
+    cfg.altitude = webServer.arg("altitude").toFloat();
+  }
+  
+  if (webServer.hasArg("latitude")) {
+    String lat = webServer.arg("latitude");
+    memset(cfg.latitude, 0, sizeof(cfg.latitude));
+    lat.toCharArray(cfg.latitude, sizeof(cfg.latitude));
+  }
+  
+  if (webServer.hasArg("longitude")) {
+    String lon = webServer.arg("longitude");
+    memset(cfg.longitude, 0, sizeof(cfg.longitude));
+    lon.toCharArray(cfg.longitude, sizeof(cfg.longitude));
+  }
+  
+  cfgSave();
+  logMessage(LOG_INFO, "Location settings saved");
+  
+  webServer.sendHeader("Location", "/mqtt");
+  webServer.send(303);
+}
+
+//---------------------
+// Save logging settings
+//---------------------
+
+void handleSaveLogging() {
+  cfg.logWeblog = webServer.hasArg("logWeblog");
+  cfg.logSyslog = webServer.hasArg("logSyslog");
+  cfg.logMqtt = webServer.hasArg("logMqtt");
+  
+  if (webServer.hasArg("syslogServer")) {
+    String server = webServer.arg("syslogServer");
+    memset(cfg.syslogServer, 0, sizeof(cfg.syslogServer));
+    server.toCharArray(cfg.syslogServer, sizeof(cfg.syslogServer));
+  }
+  
+  cfgSave();
+  logMessage(LOG_INFO, "Logging settings saved");
+  
+  webServer.sendHeader("Location", "/mqtt");
+  webServer.send(303);
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// OTA UPDATE HANDLERS
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// OTA upload handler
+//---------------------
+
+void handleUpdate() {
+  HTTPUpload& upload = webServer.upload();
+  
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("Update: %s\n", upload.filename.c_str());
+    logMessage(LOG_INFO, "OTA update started");
+    
+    uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    if (!Update.begin(maxSketchSpace)) {
+      Update.printError(Serial);
+      logMessage(LOG_ERROR, "OTA update failed to start");
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+      logMessage(LOG_ERROR, "OTA write error");
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+      logMessage(LOG_INFO, "OTA update completed");
+    } else {
+      Update.printError(Serial);
+      logMessage(LOG_ERROR, "OTA update failed");
+    }
+  }
+}
+
+//---------------------
+// OTA upload complete
+//---------------------
+
+void handleUpdateDone() {
+  if (Update.hasError()) {
+    webServer.send(500, "text/plain", "Update failed!");
+  } else {
+    webServer.send(200, "text/plain", "Update successful! Rebooting...");
+    delay(1000);
+    ESP.restart();
+  }
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// JSON API
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// JSON data endpoint
+//---------------------
+
+// Returns all sensor data as JSON
+void handleJSON() {
+  float temp  = bme.readTemperature();
+  float hum   = bme.readHumidity();
+  float press = bme.readPressure() / 100.0f;
+  float dew   = dewPoint(temp, hum);
+  
+  updateBarometer(press);
+  int trend   = calcBaroTrend();
+  int warning = calculateWeatherWarning(temp, hum, dew, trend);
+  
+  String ts = utcTimeISO8601();
+  
+  String json = "{\n";
+  json += "  \"temperature\":{\"value\":" + String(temp, 2) + ",\"unit\":\"°C\",\"ts\":\"" + ts + "\"},\n";
+  json += "  \"humidity\":{\"value\":" + String(hum, 2) + ",\"unit\":\"%\",\"ts\":\"" + ts + "\"},\n";
+  json += "  \"pressure\":{\"value\":" + String(press, 2) + ",\"unit\":\"hPa\",\"ts\":\"" + ts + "\"},\n";
+  json += "  \"barometer\":{\"value\":" + String(trend) + ",\"ts\":\"" + ts + "\"},\n";
+  json += "  \"dewpoint\":{\"value\":" + String(dew, 2) + ",\"ts\":\"" + ts + "\"},\n";
+  json += "  \"warning\":{\"value\":" + String(warning) + ",\"text\":\"" + getWarningText(warning) + "\",\"ts\":\"" + ts + "\"},\n";
+  json += "  \"location\":{\"lat\":\"" + String(cfg.latitude) + "\",\"lon\":\"" + String(cfg.longitude) + "\",\"alt\":" + String(cfg.altitude,1) + "}\n";
+  json += "}";
+
+  // HTML wrapper for black background with orange text
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<style>body{background:#000;color:#ffb000;font-family:monospace;margin:10px;white-space:pre;}</style>";
+  html += "</head><body>" + json + "</body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+//---------------------
+// MQTT status API
+//---------------------
+
+// Returns current MQTT status as JSON (for JavaScript polling)
+void handleMQTTStatusAPI() {
+  String json = "{";
+  json += "\"active\":" + String(cfg.mqttActive) + ",";
+  json += "\"status\":" + String(mqttStatus);
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// SYSTEM FUNCTIONS
+//═══════════════════════════════════════════════════════════════════════════════
+
+//---------------------
+// Erase complete EEPROM
+//---------------------
+
+// Deletes all saved settings and restarts the ESP
+void handleEraseConfig() {
+  cfgEraseAll();
+  logMessage(LOG_INFO, "EEPROM completely erased");
+  webServer.send(200, "text/plain", "EEPROM erased. Restarting...");
+  delay(1000);
+  ESP.restart();
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// SETUP
+//═══════════════════════════════════════════════════════════════════════════════
+
+void setup() {
+  // Start serial interface
+  Serial.begin(115200);
+  delay(1000);
+  Serial.print("Config Size: ");
+  Serial.println(sizeof(Config));
+
+  // Initialize reset button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+    
+  // Start EEPROM and I2C
+  EEPROM.begin(EEPROM_SIZE);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  
+  // Initialize BME280 sensor
+  bme.begin(0x76);
+
+  // Check if reset button is pressed
+  bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
+
+  // Load configuration
+  if (!cfgLoad()) {
+    cfgSetDefaults();
+    cfgSave();
+  }
+
+  logMessage(LOG_INFO, "System started");
+
+  // Decide WiFi mode
+  if (buttonPressed) {
+    // Button pressed -> force AP mode
+    startAPMode();
+  } else {
+    // Try normal WiFi connection
+    if (!connectToWiFi()) {
+      startAPMode();
+    }
+  }
+
+  // In station mode: Initialize time and MQTT
+  if (!apMode) {
+    setupTime();
+    setupOTA();
+    connectMQTT();
+  }
+
+  // Register web server routes
+  if (apMode) {
+    // AP mode: Only configuration page
+    webServer.on("/", handleAPConfig);
+    webServer.on("/save", HTTP_POST, handleAPSave);
+  } else {
+    // Station mode: All pages
+    webServer.on("/", handleRoot);
+    webServer.on("/mqtt", handleMQTTPage);
+    webServer.on("/system", handleSystemPage);
+    webServer.on("/log", handleLogPage);
+    webServer.on("/json", handleJSON);
+    webServer.on("/saveWifi", HTTP_POST, handleSaveWifi);
+    webServer.on("/saveMqtt", HTTP_POST, handleSaveMqtt);
+    webServer.on("/saveLocation", HTTP_POST, handleSaveLocation);
+    webServer.on("/saveLogging", HTTP_POST, handleSaveLogging);
+    webServer.on("/update", HTTP_POST, handleUpdateDone, handleUpdate);
+    webServer.on("/eraseConfig", handleEraseConfig);
+    webServer.on("/api/mqtt-status", handleMQTTStatusAPI);
+  }
+
+  // Start web server
+  webServer.begin();
+  Serial.println("Web server started!");
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════════
+// LOOP
+//═══════════════════════════════════════════════════════════════════════════════
+
+void loop() {
+  // Handle web server requests
+  webServer.handleClient();
+  
+  // Handle OTA updates (only in station mode)
+  if (!apMode) {
+    ArduinoOTA.handle();
+  }
+  
+  // Measure CPU usage
+  measureCPU();
+  
+  // MQTT handling (only in station mode)
+  if (!apMode) {
+    // Maintain MQTT connection
+    if (cfg.mqttActive) {
+      if (!mqtt.connected()) {
+        connectMQTT();
+      } else {
+        mqtt.loop();
+      }
+    }
+    
+    // Publish sensor data every 5 seconds
+    static unsigned long lastPublish = 0;
+    unsigned long now = millis();
+    if (now - lastPublish >= 5000) {
+      lastPublish = now;
+      
+      if (mqtt.connected()) {
+        publishSensorData();
+        
+        // Send Home Assistant Discovery once per hour
+        static unsigned long lastDiscovery = 0;
+        if (now - lastDiscovery >= 3600000 || lastDiscovery == 0) {
+          lastDiscovery = now;
+          publishHADiscovery();
+        }
+      }
+    }
+  }
+}
