@@ -1,30 +1,39 @@
+>🇺🇸🇬🇧🇫🇷🇪🇸🇮🇹🇪🇺🇺🇦🇦🇺🇫🇮🇨🇿🇧🇷🇨🇦🇰🇿🇨🇴🇲🇶🇳🇬🇸🇨🇪🇭🇺🇾🇺🇬🏳️🏴‍☠️
+>
+>International users: Please use your Browsers translation feature. This Text is written in german language. A translation from german into other languages mainly generates better results then a translation from any language into german. Thanks for your compliance.
+>
+
 # Wetter•Freund
-The Wetter•Freund is a DIY Weather station with ESP and Arduino. Don't spend €150 (or more) on Amazon – just build your own smart weather station with WebUI and a couple of cool functions for just a few bucks. You just need some electronic parts you can easily buy on AliExpress (5€-all together) and a housing which is about €15. Use my code as is or adopt it on your needs or language. But most important: have fun!
+
+Der Wetter•Freund ist eine DIY-Wetterstation mit ESP und Arduino. Gebt nicht 150 € (oder mehr) auf Amazon aus – baut euch einfach deine eigene smarte Wetterstation mit WebUI und ein paar coolen Funktionen – für nur ein paar Euro. Ihr braucht lediglich ein paar elektronische Bauteile, die ihr problemlos auf AliExpress kaufen könnt (insgesamt etwa 5 €), sowie ein Gehäuse für rund 15 €. Nutzt gerne meinen Code wie er ist oder passt ihn an eure Bedürfnisse oder Sprachen an. Aber was das Wichtigste ist: Habt Spaß dabei!
 
 ### Hardware:
-- ESP-02s (8285) - any ESP8266 should work at least!
+- ESP-02s (8285) - aber jeder ESP8266 sollte funktionieren! Füt ESP32 muss man andere Bibliotheken einfügen. Aber  ein ESP32 ist gar nicht nötig.
 - BME280 Sensor
 - Buck-Converter 5V/3,3V
-- LED flashlight (to avoid plane crashes ... ;-))
-- Switch to start AP
+- LED mit Farbwechsel (zur Vermeidung von Flugzeugkollisionen ... 😉)
+- Notfalltaster für den AP-Modus
 
-### Functions of the Software:
-- Data Preview
-- Calculated date (Barometer, dewpoint, weather warnings)
-- Location
+### Softwarefunktionen:
+- Vorschau der Live-Werte
+- Daraus errechnete/ermittelte Werte (Barometer, Taupunkt, Wetterwarnungen)
+- Standort (manuelle Eingabe)
 - MQTT
-- Logs (different)
-- Telemetry data
+- Verschiedene Logs
+- Anzeige von Systemdaten
 - OTA(!)
 - JSON
 - RESET
+- Automatisierte Anbindung an HomeAssistant über MQTT
+- Integration für HomeAssistant ist in Arbeit ...
 
-### What we don't offer:
-- NO useless or unusable spy app
-- NO Cloud at the end of the world collecting your data. YOUR data stays in YOUR home!
-- NO eye-burning dashboard - the software ist for admin use, but it still looks kind of nice.
+### Was er nicht kann:
+- KEINE nutzlose oder unbenutzbare Spionageapp!
+- KEINE Cloud irgendwo am Ende der Welt. Eure Daten bleiben in eurem Haus!
+- KEIN schickes Wetter-Dashboard. Es ist eigentlich ein Admin-Tool. Aber wer behauptet, dass Admin-Tools langweilig aussehen müssen ...
+  
+Startet die Reise in meinem [WIKI](https://github.com/dummbold/Wetter-Freund/wiki)
 
-Start your journey in the [WIKI](https://github.com/dummbold/Wetter-Freund/wiki)
+‼️ ACHTUNG: neues GUI ist quasi schon fertig und befindet sich in der Testphase. Dazu muss der ESP aber komplett gelöscht werden (andere EEPROM-Struktur). Nehmt euch die Zeit die Hardware in aller Ruhe zu bauen. Bis ihr fertig seid gibt es dann hier auch den neuen Sketch mit der neuen Oberfläche – Stand: 19.12.2025‼️
 
-This documentation is written in german language – please note the Information for different languages at the beginning of the HOME-Page.
 
