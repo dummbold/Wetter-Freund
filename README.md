@@ -10,7 +10,7 @@ Der Wetter•Freund ist eine DIY-Wetterstation mit ESP und Arduino. Gebt nicht 1
 ❗️Diese Wetterstation ist **nur** für Temperatur, Luftdruck und Luftfeuchte sowie daraus errechnete/abgeleitete Werte. An Messgeräten für Wind und Regen arbeite ich noch.
 
 ### Hardware:
-- ESP-02s (8285) - aber jeder ESP8266 sollte funktionieren! Füt ESP32 muss man andere Bibliotheken einfügen. Aber  ein ESP32 ist gar nicht nötig.
+- ESP-02S (8285) - aber jeder ESP8266 sollte funktionieren! Füt ESP32 muss man andere Bibliotheken einfügen. Aber  ein ESP32 ist gar nicht nötig.
 - BME280 Sensor
 - Buck-Converter 5V/3,3V
 - LED mit Farbwechsel (zur Vermeidung von Flugzeugkollisionen ... 😉)
