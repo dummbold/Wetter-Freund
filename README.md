@@ -5,7 +5,9 @@
 
 # Wetter•Freund
 
-Der Wetter•Freund ist eine DIY-Wetterstation mit ESP und Arduino. Gebt nicht 150 € (oder mehr) auf Amazon aus – baut euch einfach deine eigene smarte Wetterstation mit WebUI und ein paar coolen Funktionen – für nur ein paar Euro. Ihr braucht lediglich ein paar elektronische Bauteile, die ihr problemlos auf AliExpress kaufen könnt (insgesamt etwa 5 €), sowie ein Gehäuse für rund 15 €. Nutzt gerne meinen Code wie er ist oder passt ihn an eure Bedürfnisse oder Sprachen an. Aber was das Wichtigste ist: Habt Spaß dabei!
+Der Wetter•Freund ist eine DIY-Wetterstation mit ESP und Arduino. Gebt nicht 150 € (oder mehr) auf Amazon aus – baut euch einfach eine eigene smarte Wetterstation mit WebUI und coolen Funktionen die keine kommerzielle Wetterstation bietet – für nur ein paar Euro. Ihr braucht lediglich ein paar elektronische Bauteile, die ihr problemlos auf AliExpress kaufen könnt (insgesamt etwa 5 €), sowie ein Gehäuse für rund 15 €. Nutzt gerne meinen Code wie er ist oder passt ihn an eure Bedürfnisse oder Sprachen an. Aber was das Wichtigste ist: Habt Spaß dabei!
+
+❗️Diese Wetterstation ist **nur** für Temperatur, Luftdruck und Luftfeuchte sowie daraus errechnete/abgeleitete Werte. An Messgeräten für Wind und Regen arbeite ich noch.
 
 ### Hardware:
 - ESP-02s (8285) - aber jeder ESP8266 sollte funktionieren! Füt ESP32 muss man andere Bibliotheken einfügen. Aber  ein ESP32 ist gar nicht nötig.
