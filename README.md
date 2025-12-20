@@ -1,4 +1,4 @@
->🇺🇸🇬🇧🇫🇷🇪🇸🇮🇹🇪🇺🇺🇦🇦🇺🇫🇮🇨🇿🇧🇷🇨🇦🇰🇿🇨🇴🇲🇶🇳🇬🇸🇨🇪🇭🇺🇾🇺🇬🏳️🏴‍☠️
+![dgpt](https://github.com/user-attachments/assets/6335a477-cbee-44fa-991d-63c1292995fa)>🇺🇸🇬🇧🇫🇷🇪🇸🇮🇹🇪🇺🇺🇦🇦🇺🇫🇮🇨🇿🇧🇷🇨🇦🇰🇿🇨🇴🇲🇶🇳🇬🇸🇨🇪🇭🇺🇾🇺🇬🏳️🏴‍☠️
 >
 >_International users: Please use your Browsers translation feature. This Text is written in german language. A translation from german into other languages mainly generates better results then a translation from any language into german. Thanks for your compliance._
 >
@@ -39,4 +39,4 @@ Startet die Reise in meinem [WIKI](https://github.com/dummbold/Wetter-Freund/wik
 ‼️ ACHTUNG: neues GUI ist quasi schon fertig und befindet sich in der Testphase. Dazu muss der ESP aber komplett gelöscht werden (andere EEPROM-Struktur). Nehmt euch die Zeit die Hardware in aller Ruhe zu bauen. Bis ihr fertig seid gibt es dann hier auch den neuen Sketch mit der neuen Oberfläche – Stand: 19.12.2025‼️
 
 
-![dgpt](https://github.com/user-attachments/assets/042a07f2-3e3f-4c9f-8ea4-bc7803ba3c1c)
+![dgpt](https://github.com/user-attachments/assets/a1089074-187f-4463-9f52-ffef512b4e60)
