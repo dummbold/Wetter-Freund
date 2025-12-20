@@ -1,4 +1,4 @@
-<div align="right">![dgpt](https://github.com/user-attachments/assets/6335a477-cbee-44fa-991d-63c1292995fa)></div>
+<p align="right">![dgpt](https://github.com/user-attachments/assets/6335a477-cbee-44fa-991d-63c1292995fa)></p>
 
 🇺🇸🇬🇧🇫🇷🇪🇸🇮🇹🇪🇺🇺🇦🇦🇺🇫🇮🇨🇿🇧🇷🇨🇦🇰🇿🇨🇴🇲🇶🇳🇬🇸🇨🇪🇭🇺🇾🇺🇬🏳️🏴‍☠️
 >
