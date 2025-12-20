@@ -1,5 +1,4 @@
-<p align="right">![dgpt](https://github.com/user-attachments/assets/a1089074-187f-4463-9f52-ffef512b4e60)
-</p>
+<p align="right"><img width="220" height="52" alt="dgpt" src="https://github.com/user-attachments/assets/e763407f-dff7-4a2b-9bbd-d04cf14373ff" /></p>
 
 🇺🇸🇬🇧🇫🇷🇪🇸🇮🇹🇪🇺🇺🇦🇦🇺🇫🇮🇨🇿🇧🇷🇨🇦🇰🇿🇨🇴🇲🇶🇳🇬🇸🇨🇪🇭🇺🇾🇺🇬🏳️🏴‍☠️
 >
@@ -41,5 +40,3 @@ Startet die Reise in meinem [WIKI](https://github.com/dummbold/Wetter-Freund/wik
 
 ‼️ ACHTUNG: neues GUI ist quasi schon fertig und befindet sich in der Testphase. Dazu muss der ESP aber komplett gelöscht werden (andere EEPROM-Struktur). Nehmt euch die Zeit die Hardware in aller Ruhe zu bauen. Bis ihr fertig seid gibt es dann hier auch den neuen Sketch mit der neuen Oberfläche – Stand: 19.12.2025‼️
 
-
-![dgpt](https://github.com/user-attachments/assets/a1089074-187f-4463-9f52-ffef512b4e60)
