@@ -38,4 +38,22 @@ Startet die Reise in meinem [WIKI](https://github.com/dummbold/Wetter-Freund/wik
 
 ‼️ ACHTUNG: neues GUI ist quasi schon fertig und befindet sich in der Testphase. Dazu muss der ESP aber komplett gelöscht werden (andere EEPROM-Struktur). Nehmt euch die Zeit die Hardware in aller Ruhe zu bauen. Bis ihr fertig seid gibt es dann hier auch den neuen Sketch mit der neuen Oberfläche – Stand: 19.12.2025‼️
 
+![dgpt](https://github.com/user-attachments/assets/042a07f2-3e3f-4c9f-8ea4-bc7803ba3c1c)
 
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 80" width="300" height="80">
+  <!-- Flaggenstreifen als Akzent - jetzt passend zu den zwei Textzeilen -->
+  <rect x="0" y="12" width="6" height="15" fill="#000000"/>
+  <rect x="0" y="27" width="6" height="15" fill="#DD0000"/>
+  <rect x="0" y="42" width="6" height="15" fill="#FFCE00"/>
+  
+  <!-- Materialisierungs-Striche + Powered By Text -->
+  <text x="15" y="25" font-family="Arial, sans-serif" font-size="14" font-weight="700" font-style="italic">
+    <tspan fill="#CCCCCC">I</tspan><tspan fill="#888888">I</tspan><tspan fill="#444444">I</tspan><tspan fill="#000000">Powered By</tspan>
+  </text>
+  
+  <!-- DeutschlandGPT Text -->
+  <text x="15" y="50" font-family="Arial, sans-serif" font-size="24" fill="#000000" font-weight="700">
+    Deutschland<tspan fill="#00A651">GPT</tspan>
+  </text>
+  
+</svg>
