@@ -2,9 +2,10 @@
 
 Version 2: Upload 2026.01.25
 - Completely new modern UI
-- Responsive desing
-- Blueprint for all IoT devices to come
+- Responsive design
 - Faster UI
+- Blueprint for all IoT devices to come
+- No-WIFI neccessary! Just select the sensor access-point and you will be directed to the UI (if not enter 10.10.10.1 in the browser)
 
 NOTE: If you upgrade from Version 1 please use the ESPutzer to clean the Data on your ESP. Version 2 uses another EEPROM-structure
 
