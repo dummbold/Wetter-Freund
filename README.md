@@ -3,9 +3,9 @@
 🇺🇸🇬🇧🇫🇷🇪🇸🇮🇹🇪🇺🇺🇦🇦🇺🇫🇮🇨🇿🇧🇷🇨🇦🇰🇿🇨🇴🇲🇶🇳🇬🇸🇨🇪🇭🇺🇾🇺🇬🏳️🏴‍☠️
 >
 >_International users:
->This Text is written in german language. Please use your Browsers translation feature to read it in your language. A translation from german into other languages mainly generates better results then a translation from any language into german. Thanks for your compliance.
+>This Text is written in german language. Please use your Browsers translation feature to read it in your language. A translation from german into other languages mainly generates better results then a translation from any language into german. Thanks for your compliance._
 >
->I will place only the german Version of the software in the repo. Please feel free to generate a Software version in your language and contact me to place your language Version here. A mulitlanguage-Version is not possible on the little ESP-02S - it will run out of Memory. But you can just drop the code into GPT and kindly ask for a translation._
+>_I will place only the german Version of the software in the repo. Please feel free to generate a Software version in your language and contact me to place your language Version here. A mulitlanguage-Version is not possible on the little ESP-02S - it will run out of Memory. But you can just drop the code into GPT and kindly ask for a translation._
 
 # Wetter•Freund
 
