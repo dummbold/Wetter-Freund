@@ -1,0 +1,2118 @@
+// Version vom 10.12.25 *15*
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ArduinoOTA.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <EEPROM.h>
+#include <PubSubClient.h>
+#include <WiFiUdp.h>
+#include <time.h>
+#include <math.h>
+#include <ESP8266mDNS.h>
+
+// ═══════════════════════════════════════════════════════
+// Hardware
+// ═══════════════════════════════════════════════════════
+#define SDA_PIN 5
+#define SCL_PIN 4
+#define BUTTON_PIN 12
+
+// ═══════════════════════════════════════════════════════
+// Loop Timing (ändern um CPU Last zu mindern - Zeit in ms)
+// ═══════════════════════════════════════════════════════
+#define LOOP_DELAY 10
+
+// ═══════════════════════════════════════════════════════
+// Zeit/NTP
+// ═══════════════════════════════════════════════════════
+const char* weekDays[] = {"Sonntag","Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag"};
+
+void setupTime() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
+}
+
+String getTimeString() {
+  time_t now = time(nullptr);
+  struct tm* tm_info = localtime(&now);
+  if (!tm_info) return String("Zeit unbekannt");
+  char dateTime[64];
+  strftime(dateTime, sizeof(dateTime), "%d.%m.%Y - %H:%M:%S Uhr", tm_info);
+  char buffer[96];
+  snprintf(buffer, sizeof(buffer), "%s, %s", weekDays[tm_info->tm_wday], dateTime);
+  return String(buffer);
+}
+
+String utcTimeISO8601() {
+  time_t now = time(nullptr);
+  if (now <= 0) return String("1970-01-01T00:00:00Z");
+  struct tm gt;
+  localtime_r(&now, &gt);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+           gt.tm_year + 1900, gt.tm_mon + 1, gt.tm_mday,
+           gt.tm_hour, gt.tm_min, gt.tm_sec);
+  return String(buf);
+}
+
+// ═══════════════════════════════════════════════════════
+// Globale Objekte
+// ═══════════════════════════════════════════════════════
+Adafruit_BME280 bme;
+ESP8266WebServer webServer(80);
+WiFiClient netClient;
+PubSubClient mqtt(netClient);
+WiFiUDP udpClient;
+
+float cpuUsage = 0.0;
+
+// ═══════════════════════════════════════════════════════
+// MQTT Status Tracking
+// ═══════════════════════════════════════════════════════
+enum MQTTConnectionStatus {
+  MQTT_STATUS_DISCONNECTED = 0,
+  MQTT_STATUS_CONNECTING = 1,
+  MQTT_STATUS_CONNECTED = 2
+};
+
+MQTTConnectionStatus mqttStatus = MQTT_STATUS_DISCONNECTED;
+String mqttLastError = "";
+unsigned long mqttLastConnectAttempt = 0;
+unsigned long mqttReconnectDelay = 5000;
+int mqttReconnectAttempts = 0;
+const int MQTT_MAX_RECONNECT_ATTEMPTS = 6;
+
+// ═══════════════════════════════════════════════════════
+// BAROMETER - Stundenwert-Logik
+// ═══════════════════════════════════════════════════════
+float pressureSum = 0.0f;
+int pressureCount = 0;
+int lastHour = -1;
+
+float hourlyValue_minus1 = NAN;
+float hourlyValue_minus2 = NAN;
+float currentHourlyValue = NAN;
+
+// ═══════════════════════════════════════════════════════
+// LOGGING SYSTEM
+// ═══════════════════════════════════════════════════════
+#define LOG_BUFFER_SIZE 50
+
+enum LogLevel {
+  LOG_INFO = 0,
+  LOG_WARN = 1,
+  LOG_ERROR = 2
+};
+
+// =======================================================
+// Message Indices für RAM-optimiertes Logging
+// Speichert nur Index (1 Byte), Text wird bei Ausgabe erzeugt
+// =======================================================
+enum MessageIndex {
+  // System
+  MSG_SYSTEM_START = 0,
+  MSG_WEBSERVER_START = 1,
+  MSG_EEPROM_ERASED = 2,
+  
+  // WLAN
+  MSG_WIFI_CONNECTED = 10,
+  MSG_WIFI_FAILED = 11,
+  MSG_AP_MODE = 12,
+  MSG_WIFI_SAVED = 13,
+  
+  // OTA
+  MSG_OTA_START = 20,
+  MSG_OTA_DONE = 21,
+  MSG_OTA_ERROR = 22,
+  
+  // MQTT
+  MSG_MQTT_SAVED = 30,
+  MSG_MQTT_CONNECTED = 31,
+  MSG_HAOS_DISCOVERY_SUCCESS = 33,
+  MSG_HAOS_DISCOVERY_FAILED = 34,
+  
+  // MQTT Fehler (detailliert)
+  MSG_MQTT_MAX_RETRIES = 39,
+  MSG_MQTT_ERROR_TIMEOUT = 40,           // -4
+  MSG_MQTT_ERROR_LOST = 41,              // -3
+  MSG_MQTT_ERROR_CONNECT_FAILED = 42,    // -2
+  MSG_MQTT_ERROR_DISCONNECTED = 43,      // -1
+  MSG_MQTT_ERROR_PROTOCOL = 44,          //  1
+  MSG_MQTT_ERROR_CLIENT_ID = 45,         //  2
+  MSG_MQTT_ERROR_UNAVAILABLE = 46,       //  3
+  MSG_MQTT_ERROR_AUTH = 47,              //  4
+  MSG_MQTT_ERROR_UNAUTHORIZED = 48,      //  5
+  MSG_MQTT_ERROR_UNKNOWN = 49,           //  unbekannt
+  
+  // Konfiguration
+  MSG_LOCATION_SAVED = 50,
+  MSG_LOGGING_SAVED = 51
+};
+
+struct LogEntry {
+  time_t timestamp;    // 4 Bytes
+  uint8_t level;       // 1 Byte
+  uint8_t msgIndex;    // 1 Byte (statt 40 Bytes für char array!)
+};
+
+LogEntry logBuffer[LOG_BUFFER_SIZE];
+int logIndex = 0;
+int logCount = 0;
+bool hasNewLogs = false;
+int lastSentLogIndex = 0;
+
+// ═══════════════════════════════════════════════════════
+// EEPROM-Konfig - MIT FLOAT FÜR LAT/LON
+// ═══════════════════════════════════════════════════════
+#define EEPROM_SIZE 512
+
+struct __attribute__((packed)) Config {
+  char     ssid[33];
+  char     pass[65];
+  char     mqttBroker[65];
+  char     mqttUser[33];
+  char     mqttPass[65];
+  uint8_t  mqttActive;
+  uint8_t  mqttParams[10];      // ✅ 8 → 10 (für 9 Parameter + Reserve)
+  float    altitude;
+  float    latitude;
+  float    longitude;
+  uint8_t  logWeblog;
+  uint8_t  logSyslog;
+  char     syslogServer[65];
+  uint8_t  logMqtt;
+  uint16_t crc;
+};
+
+constexpr size_t CFG_LEN_NO_CRC = offsetof(Config, crc);
+
+Config cfg;
+
+uint16_t crc16(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
+    }
+  }
+  return crc;
+}
+
+void cfgSetDefaults() {
+  memset(&cfg, 0, sizeof(cfg));
+  
+  // ✅ WLAN leer = AP-Modus beim nächsten Boot
+  cfg.ssid[0] = '\0';
+  cfg.pass[0] = '\0';
+  
+  cfg.mqttActive = 0;
+  for (int i = 0; i < 10; i++) cfg.mqttParams[i] = 0;
+  cfg.altitude = 0.0f;
+  cfg.latitude = 0.0f;
+  cfg.longitude = 0.0f;
+  cfg.mqttUser[0]  = '\0';
+  cfg.mqttPass[0]  = '\0';
+  cfg.logWeblog = 1;
+  cfg.logSyslog = 0;
+  cfg.syslogServer[0] = '\0';
+  cfg.crc = crc16(reinterpret_cast<const uint8_t*>(&cfg), CFG_LEN_NO_CRC);
+}
+
+bool cfgLoad() {
+  if (sizeof(Config) > EEPROM_SIZE) {
+    Serial.println("CONFIG TOO LARGE FOR EEPROM!");
+    return false;
+  }
+
+  EEPROM.get(0, cfg);
+
+  Serial.println("\n=== EEPROM CONFIG ===");
+  Serial.print("WiFi SSID: ");     Serial.println(cfg.ssid);
+  Serial.print("WiFi Pass: ");     Serial.println(cfg.pass[0] ? "***" : "(leer)");
+  Serial.print("MQTT Broker: ");   Serial.println(cfg.mqttBroker);
+  Serial.print("MQTT User: ");     Serial.println(cfg.mqttUser);
+  Serial.print("MQTT Pass: ");     Serial.println(cfg.mqttPass[0] ? "***" : "(leer)");
+  Serial.print("MQTT Active: ");   Serial.println(cfg.mqttActive);
+  Serial.print("Altitude: ");      Serial.print(cfg.altitude); Serial.println(" m");
+  Serial.print("Latitude: ");      Serial.println(cfg.latitude, 6);
+  Serial.print("Longitude: ");     Serial.println(cfg.longitude, 6);
+  Serial.print("Log Weblog: ");    Serial.println(cfg.logWeblog);
+  Serial.print("Log Syslog: ");    Serial.println(cfg.logSyslog);
+  Serial.print("Syslog Server: "); Serial.println(cfg.syslogServer);
+  Serial.println("====================\n");
+
+  uint16_t crcCalc = crc16(reinterpret_cast<const uint8_t*>(&cfg), CFG_LEN_NO_CRC);
+  if (crcCalc != cfg.crc) {
+    Serial.println("CRC CHECK FAILED!");
+    return false;
+  }
+
+  return true;
+}
+
+void cfgSave() {
+  cfg.crc = crc16(reinterpret_cast<const uint8_t*>(&cfg), CFG_LEN_NO_CRC);
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+}
+
+void cfgEraseAll() {
+  Serial.println("🚨 EMERGENCY: Lösche komplettes EEPROM...");
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    EEPROM.write(i, 0xFF);
+  }
+  EEPROM.commit();
+  Serial.println("✅ EEPROM gelöscht!");
+}
+
+void cfgClearMQTT() {
+  cfg.mqttBroker[0] = '\0';
+  cfg.mqttUser[0]   = '\0';
+  cfg.mqttPass[0]   = '\0';
+  cfg.mqttActive    = 0;
+  for (int i = 0; i < 10; i++) cfg.mqttParams[i] = 0;  // ✅ 8 → 10
+  cfgSave();
+}
+
+// =======================================================
+// getText() - Übersetzt Message-Index in Text
+// Wird bei Ausgabe (Weblog/Syslog/MQTT) aufgerufen
+// =======================================================
+const char* getText(uint8_t msgIndex) {
+  switch(msgIndex) {
+    // System
+    case MSG_SYSTEM_START:              return "System gestartet";
+    case MSG_WEBSERVER_START:           return "Webserver gestartet";
+    case MSG_EEPROM_ERASED:             return "EEPROM geloescht";
+    
+    // WLAN
+    case MSG_WIFI_CONNECTED:            return "WLAN verbunden";
+    case MSG_WIFI_FAILED:               return "WLAN-Verbindung fehlgeschlagen";
+    case MSG_AP_MODE:                   return "AP-Modus aktiv";
+    case MSG_WIFI_SAVED:                return "WLAN gespeichert";
+    
+    // OTA
+    case MSG_OTA_START:                 return "OTA Update gestartet";
+    case MSG_OTA_DONE:                  return "OTA Update abgeschlossen";
+    case MSG_OTA_ERROR:                 return "OTA Fehler";
+    
+    // MQTT
+    case MSG_MQTT_SAVED:                return "MQTT gespeichert";
+    case MSG_MQTT_CONNECTED:            return "MQTT verbunden";
+    case MSG_HAOS_DISCOVERY_SUCCESS:    return "HAOS Auto-Discovery erfolgreich";
+    case MSG_HAOS_DISCOVERY_FAILED:     return "HAOS Auto-Discovery fehlgeschlagen";
+    
+    // MQTT Fehler (detailliert)
+    case MSG_MQTT_MAX_RETRIES:          return "MQTT Fehler: Abbruch nach 6 Versuchen";
+    case MSG_MQTT_ERROR_TIMEOUT:        return "MQTT Fehler: Timeout";
+    case MSG_MQTT_ERROR_LOST:           return "MQTT Fehler: Verbindung verloren";
+    case MSG_MQTT_ERROR_CONNECT_FAILED: return "MQTT Fehler: Connect fehlgeschlagen";
+    case MSG_MQTT_ERROR_DISCONNECTED:   return "MQTT Fehler: Nicht verbunden";
+    case MSG_MQTT_ERROR_PROTOCOL:       return "MQTT Fehler: Falsches Protokoll";
+    case MSG_MQTT_ERROR_CLIENT_ID:      return "MQTT Fehler: Client-ID abgelehnt";
+    case MSG_MQTT_ERROR_UNAVAILABLE:    return "MQTT Fehler: Server nicht erreichbar";
+    case MSG_MQTT_ERROR_AUTH:           return "MQTT Fehler: Login fehlgeschlagen";
+    case MSG_MQTT_ERROR_UNAUTHORIZED:   return "MQTT Fehler: Nicht autorisiert";
+    case MSG_MQTT_ERROR_UNKNOWN:        return "MQTT Fehler: Unbekannt";
+    
+    // Konfiguration
+    case MSG_LOCATION_SAVED:            return "Standort gespeichert";
+    case MSG_LOGGING_SAVED:             return "Logging gespeichert";
+    
+    default:                            return "Unbekannte Nachricht";
+  }
+}
+
+// =======================================================
+// logMessage() - Speichert NUR den Index
+// Text wird NICHT gespeichert, sondern bei Ausgabe erzeugt
+// =======================================================
+void logMessage(uint8_t level, uint8_t messageIndex) {
+  if (!cfg.logWeblog && level != LOG_ERROR) return;
+  
+  logBuffer[logIndex].timestamp = time(nullptr);
+  logBuffer[logIndex].level = level;
+  logBuffer[logIndex].msgIndex = messageIndex;  // <- NUR Index!
+  
+  logIndex = (logIndex + 1) % LOG_BUFFER_SIZE;
+  if (logCount < LOG_BUFFER_SIZE) logCount++;
+  // Syslog senden
+  if (cfg.logSyslog) {
+    sendSyslog(level, getText(messageIndex));
+  }
+  hasNewLogs = true;
+}
+
+// ═══════════════════════════════════════════════════════
+// Syslog senden (RFC 5424)
+// ═══════════════════════════════════════════════════════
+void sendSyslog(uint8_t level, const char* message) {
+  if (!cfg.logSyslog || cfg.syslogServer[0] == '\0') return;
+  
+  String serverStr = String(cfg.syslogServer);
+  String host = serverStr;
+  int port = 514;
+  
+  int colonPos = serverStr.indexOf(':');
+  if (colonPos > 0) {
+    host = serverStr.substring(0, colonPos);
+    port = serverStr.substring(colonPos + 1).toInt();
+    if (port <= 0 || port > 65535) port = 514;
+  }
+  
+  // Syslog Severity: INFO=6, WARN=4, ERROR=3
+  int severity = (level == LOG_INFO) ? 6 : (level == LOG_WARN) ? 4 : 3;
+  int facility = 16; // local0
+  int priority = (facility * 8) + severity;
+  
+  String hostname = "ESP-BME280";
+  String appName = "weather";
+  
+  String syslogMsg = "<" + String(priority) + ">1 ";
+  syslogMsg += utcTimeISO8601() + " ";
+  syslogMsg += hostname + " ";
+  syslogMsg += appName + " - - - ";
+  syslogMsg += message;
+  
+  udpClient.beginPacket(host.c_str(), port);
+  udpClient.write(syslogMsg.c_str());
+  udpClient.endPacket();
+}
+
+// ═══════════════════════════════════════════════════════
+// WLAN
+// ═══════════════════════════════════════════════════════
+bool connectToWiFi() {
+  Serial.print("Verbinde mit WLAN: ");
+  Serial.println(cfg.ssid);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(cfg.ssid, cfg.pass);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    Serial.print(".");
+    delay(500);
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Verbunden!");
+    Serial.print("IP-Adresse: ");
+    Serial.println(WiFi.localIP());
+    logMessage(LOG_INFO, MSG_WIFI_CONNECTED);
+    return true;
+  } else {
+    Serial.println("\n❌ Verbindung fehlgeschlagen!");
+    logMessage(LOG_ERROR, MSG_WIFI_FAILED);
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// Access Point starten
+// ═══════════════════════════════════════════════════════
+void startAccessPoint() {
+  Serial.println("🔶 Starte Access Point...");
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(
+    IPAddress(10, 10, 10, 1),    // AP IP
+    IPAddress(10, 10, 10, 1),    // Gateway
+    IPAddress(255, 255, 255, 0)  // Subnet
+  );
+  
+  WiFi.softAP("ESP-BME280-Setup");  // Kein Passwort!
+  
+  Serial.println("✅ AP gestartet!");
+  Serial.println("📡 SSID: ESP-BME280-Setup");
+  Serial.println("🌐 IP: http://10.10.10.1");
+  
+  logMessage(LOG_INFO, MSG_AP_MODE);
+}
+
+// ═══════════════════════════════════════════════════════
+// OTA Setup
+// ═══════════════════════════════════════════════════════
+void setupOTA() {
+  ArduinoOTA.setHostname("ESP-BME280");
+  
+  ArduinoOTA.onStart([]() {
+    String type = (ArduinoOTA.getCommand() == U_FLASH) ? "Sketch" : "Filesystem";
+    logMessage(LOG_INFO, MSG_OTA_START);
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    logMessage(LOG_INFO, MSG_OTA_DONE);
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    // Progress wird nicht geloggt
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    String errorMsg = "OTA Fehler: ";
+    if (error == OTA_AUTH_ERROR) errorMsg += "Auth Failed";
+    else if (error == OTA_BEGIN_ERROR) errorMsg += "Begin Failed";
+    else if (error == OTA_CONNECT_ERROR) errorMsg += "Connect Failed";
+    else if (error == OTA_RECEIVE_ERROR) errorMsg += "Receive Failed";
+    else if (error == OTA_END_ERROR) errorMsg += "End Failed";
+    logMessage(LOG_ERROR, MSG_OTA_ERROR);
+  });
+  
+  ArduinoOTA.begin();
+}
+
+// ═══════════════════════════════════════════════════════
+// CPU-Messung
+// ═══════════════════════════════════════════════════════
+void updateCPUUsage() {
+  static unsigned long lastMeasurement = 0;
+  static unsigned long loopCounter = 0;
+  
+  loopCounter++;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastMeasurement >= 2000) {
+    unsigned long timeDiff = currentTime - lastMeasurement;
+    float loopsPerSecond = (loopCounter * 1000.0) / timeDiff;
+    
+    Serial.print("Loops/s: ");
+    Serial.print(loopsPerSecond);
+    Serial.print(" | CPU: ");
+    Serial.println(cpuUsage);
+
+    // Zeit pro Loop in ms
+    float timePerLoop = 1000.0 / loopsPerSecond;
+    
+    // Arbeitszeit = Gesamtzeit - Delay
+    float workTime = timePerLoop - LOOP_DELAY;
+    
+    // CPU-Last = (Arbeitszeit / theoretische Arbeitszeit) × 100
+    cpuUsage = (workTime / LOOP_DELAY) * 100.0;
+    
+    if (cpuUsage < 0) cpuUsage = 0;
+    if (cpuUsage > 100) cpuUsage = 100;
+    
+    loopCounter = 0;
+    lastMeasurement = currentTime;
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// Taupunkt errechnen
+// ═══════════════════════════════════════════════════════
+float dewPoint(float temp, float hum) {
+  const float a = 17.62f;
+  const float b = 243.12f;
+  float gamma = log(hum / 100.0f) + (a * temp) / (b + temp);
+  return (b * gamma) / (a - gamma);
+}
+
+// ═══════════════════════════════════════════════════════
+// BAROMETER
+// ═══════════════════════════════════════════════════════
+void updateBarometer(float currentPressure) {
+  if (isnan(currentPressure)) return;
+  
+  time_t now = time(nullptr);
+  struct tm* tm_info = localtime(&now);
+  if (!tm_info) return;
+  int currentHour = tm_info->tm_hour;
+  
+  if (lastHour >= 0 && currentHour != lastHour) {
+    if (pressureCount > 0) {
+      float finishedHourValue = pressureSum / pressureCount;
+      hourlyValue_minus2 = hourlyValue_minus1;
+      hourlyValue_minus1 = finishedHourValue;
+    }
+    pressureSum = 0.0f;
+    pressureCount = 0;
+  }
+  
+  lastHour = currentHour;
+  pressureSum += currentPressure;
+  pressureCount++;
+  currentHourlyValue = pressureSum / pressureCount;
+}
+
+bool baroReady() {
+  return (!isnan(currentHourlyValue) && !isnan(hourlyValue_minus2));
+}
+
+int calcBaroTrend() {
+  if (!baroReady()) return -999;
+  float diff = currentHourlyValue - hourlyValue_minus2;
+  if (diff > 2.0f) return 3;
+  if (diff > 1.0f) return 2;
+  if (diff > 0.5f) return 1;
+  if (diff < -2.0f) return -3;
+  if (diff < -1.0f) return -2;
+  if (diff < -0.5f) return -1;
+  return 0;
+}
+
+String baroIcons(int trend) {
+  const char* gray = "⚪️";
+  
+  // Keine Daten vorhanden → alles grau
+  if (trend == -999) {
+    String out = "➖ ";
+    for (int i = 0; i < 7; i++) {
+      out += gray;
+      if (i < 6) out += " ";
+    }
+    out += " ➕";
+    return out;
+  }
+  
+  // Normale Anzeige mit Daten
+  if (trend < -3) trend = -3;
+  if (trend > 3)  trend =  3;
+  const char* colored[7] = {"🔴","🟠","🟡","🔵","🟡","🟠","🔴"};
+  const int center = 3;
+  const int active = center + trend;
+  String out = "➖ ";
+  for (int i = 0; i < 7; i++) {
+    bool isCenter = (i == center);
+    bool isActive = (i == active);
+    if (isCenter || isActive) {
+      out += colored[i];
+    } else {
+      out += gray;
+    }
+    if (i < 6) out += " ";
+  }
+  out += " ➕";
+  return out;
+}
+// ═══════════════════════════════════════════════════════
+// WETTERWARNUNG
+// ═══════════════════════════════════════════════════════
+int calculateWeatherWarning(float temp, float hum, float dew, int baroTrend) {
+  if (temp >= -1.0f && temp <= 4.0f && hum > 75.0f) {
+    return 4;
+  }
+  if (temp < 2.0f && hum > 85.0f && baroTrend < 0) {
+    return 2;
+  }
+  float tempDewDiff = temp - dew;
+  if (tempDewDiff < 2.5f && hum > 90.0f) {
+    return 3;
+  }
+  if (hum > 85.0f && baroTrend < 0) {
+    return 1;
+  }
+  return 0;
+}
+
+String getWarningIcon(int warning) {
+  switch(warning) {
+    case 1: return "🌧️";
+    case 2: return "🌨️";
+    case 3: return "🌫️";
+    case 4: return "❄️";
+    default: return "—";
+  }
+}
+
+String getWarningText(int warning) {
+  switch(warning) {
+    case 1: return "Regen";
+    case 2: return "Schnee";
+    case 3: return "Nebel";
+    case 4: return "Glatteis";
+    default: return "Keine";
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// MQTT
+// ═══════════════════════════════════════════════════════
+String getMQTTErrorText(int state) {
+  switch(state) {
+    case -4: return "Timeout";
+    case -3: return "Verbindung verloren";
+    case -2: return "Connect fehlgeschlagen";
+    case -1: return "Nicht verbunden";
+    case 0: return "Verbunden";
+    case 1: return "Falsches Protokoll";
+    case 2: return "Client-ID abgelehnt";
+    case 3: return "Server nicht erreichbar";
+    case 4: return "Login fehlgeschlagen";
+    case 5: return "Nicht autorisiert";
+    default: return "Unbekannter Fehler (" + String(state) + ")";
+  }
+}
+
+// =======================================================
+// getMQTTErrorIndex() - Mapped MQTT-State auf Message-Index
+// =======================================================
+uint8_t getMQTTErrorIndex(int state) {
+  switch(state) {
+    case -4: return MSG_MQTT_ERROR_TIMEOUT;
+    case -3: return MSG_MQTT_ERROR_LOST;
+    case -2: return MSG_MQTT_ERROR_CONNECT_FAILED;
+    case -1: return MSG_MQTT_ERROR_DISCONNECTED;
+    case  1: return MSG_MQTT_ERROR_PROTOCOL;
+    case  2: return MSG_MQTT_ERROR_CLIENT_ID;
+    case  3: return MSG_MQTT_ERROR_UNAVAILABLE;
+    case  4: return MSG_MQTT_ERROR_AUTH;
+    case  5: return MSG_MQTT_ERROR_UNAUTHORIZED;
+    default: return MSG_MQTT_ERROR_UNKNOWN;
+  }
+}
+
+void connectMQTT() {
+  if (!cfg.mqttActive || cfg.mqttBroker[0] == '\0') {
+    mqttStatus = MQTT_STATUS_DISCONNECTED;
+    mqttLastError = "MQTT nicht konfiguriert";
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Check ob max Versuche erreicht
+  if (mqttReconnectAttempts >= MQTT_MAX_RECONNECT_ATTEMPTS) {
+    cfg.mqttActive = false;
+    cfgSave();
+    mqttStatus = MQTT_STATUS_DISCONNECTED;
+    mqttLastError = "Max Reconnect-Versuche erreicht";
+    logMessage(LOG_ERROR, MSG_MQTT_MAX_RETRIES);
+    return;
+  }
+
+  // Check ob genug Zeit vergangen ist
+  if (now - mqttLastConnectAttempt < mqttReconnectDelay) {
+    return;
+  }
+
+  mqttLastConnectAttempt = now;
+  mqttReconnectAttempts++;
+
+  String brokerStr = String(cfg.mqttBroker);
+  String host = brokerStr;
+  int port = 1883;
+  
+  int colonPos = brokerStr.indexOf(':');
+  if (colonPos > 0) {
+    host = brokerStr.substring(0, colonPos);
+    port = brokerStr.substring(colonPos + 1).toInt();
+    if (port <= 0 || port > 65535) port = 1883;
+  }
+
+  mqttStatus = MQTT_STATUS_CONNECTING;
+  mqtt.setServer(host.c_str(), port);
+  mqtt.setBufferSize(512);
+
+  bool connected = false;
+  if (cfg.mqttUser[0] != '\0') {
+    connected = mqtt.connect("ESP-BME280", cfg.mqttUser, cfg.mqttPass);
+  } else {
+    connected = mqtt.connect("ESP-BME280");
+  }
+
+  if (connected) {
+    mqttStatus = MQTT_STATUS_CONNECTED;
+    mqttLastError = "";
+    mqttReconnectAttempts = 0;           // ← NEU! Counter zurücksetzen
+    mqttReconnectDelay = 5000;           // ← NEU! Delay zurücksetzen
+    logMessage(LOG_INFO, MSG_MQTT_CONNECTED);
+  } else {
+    mqttStatus = MQTT_STATUS_DISCONNECTED;
+    int state = mqtt.state();
+    mqttLastError = getMQTTErrorText(state);
+    logMessage(LOG_ERROR, getMQTTErrorIndex(state));
+    
+    // Delay verdoppeln für nächsten Versuch
+    mqttReconnectDelay *= 2;             // ← NEU! 5s → 10s → 20s → 40s → 80s
+  }
+}
+
+// =======================================================
+// buildLogJSON() - Baut JSON aus neuen Log-Einträgen
+// Wird nur aufgerufen wenn MQTT-Log aktiv ist
+// =======================================================
+String buildLogJSON() {
+  if (logCount == 0) return "";
+  if (lastSentLogIndex == logIndex && logCount < LOG_BUFFER_SIZE) return "";
+  
+  StaticJsonDocument<512> doc;
+  JsonArray entries = doc.createNestedArray("logs");
+  
+  int count = 0;
+  int maxEntries = 10;  // Max 10 Einträge pro MQTT-Nachricht
+  
+  // Vom letzten gesendeten Index bis zum aktuellen
+  for (int i = 0; i < logCount && count < maxEntries; i++) {
+    int idx = (lastSentLogIndex + i) % LOG_BUFFER_SIZE;
+    if (idx == logIndex) break;  // Aktueller Index erreicht
+    
+    LogEntry& entry = logBuffer[idx];
+    JsonObject obj = entries.createNestedObject();
+    
+    obj["ts"] = entry.timestamp;
+    obj["lvl"] = entry.level;
+    obj["msg"] = getText(entry.msgIndex);
+    
+    count++;
+  }
+  
+  if (count == 0) return "";
+  
+  lastSentLogIndex = (lastSentLogIndex + count) % LOG_BUFFER_SIZE;
+  
+  String output;
+  serializeJson(doc, output);
+  return output;
+}
+
+void publishMQTT() {
+  if (mqttStatus != MQTT_STATUS_CONNECTED) return;
+
+  float temp  = bme.readTemperature();
+  float hum   = bme.readHumidity();
+  float press = bme.readPressure() / 100.0f;
+  float dew   = dewPoint(temp, hum);
+  int trend   = calcBaroTrend();
+  int warning = calculateWeatherWarning(temp, hum, dew, trend);
+
+  String ts = utcTimeISO8601();
+
+  struct MQTTParam {
+    const char* topic;
+    String value;
+    uint8_t paramIndex;
+  };
+
+  MQTTParam params[7] = {
+    {"bme280/temperature", String(temp, 2) + "|" + ts, 0},
+    {"bme280/humidity", String(hum, 2) + "|" + ts, 1},
+    {"bme280/pressure", String(press, 2) + "|" + ts, 2},
+    {"bme280/barometer", String(trend) + "|" + ts, 3},
+    {"bme280/dewpoint", String(dew, 2) + "|" + ts, 4},
+    {"bme280/warning", String(warning) + "|" + getWarningText(warning) + "|" + ts, 5},
+    {"bme280/log", "", 6}
+  };
+
+for (int i = 0; i < 7; i++) {
+    if (cfg.mqttParams[i] >= 1) {
+      bool retain = (cfg.mqttParams[i] == 2);
+      
+      // Sonderbehandlung für Log (Index 6)
+      if (i == 6) {
+        String logPayload = buildLogJSON();
+        if (logPayload.length() > 0) {
+          mqtt.publish(params[i].topic, logPayload.c_str(), retain);
+        }
+      } else {
+        mqtt.publish(params[i].topic, params[i].value.c_str(), retain);
+      }
+    }
+  }
+}
+
+bool sendHAOSDiscovery() {
+  if (mqttStatus != MQTT_STATUS_CONNECTED) return false;
+
+  String deviceJson = "\"device\":{";
+  deviceJson += "\"identifiers\":[\"" + WiFi.macAddress() + "\"],";
+  deviceJson += "\"name\":\"ESP-BME280 Sensor\",";
+  deviceJson += "\"model\":\"ESP-02S + BME280\",";
+  deviceJson += "\"manufacturer\":\"Custom\"";
+  deviceJson += "}";
+
+  struct Sensor {
+    const char* component;
+    const char* objectId;
+    const char* name;
+    const char* stateTopic;
+    const char* unit;
+    const char* deviceClass;
+    const char* icon;
+    const char* valueTemplate;
+  };
+
+  Sensor sensors[6] = {
+    {"sensor", "bme280_temperature", "Temperatur", "bme280/temperature", "°C", "temperature", "mdi:thermometer", "{{ value.split('|')[0] }}"},
+    {"sensor", "bme280_humidity", "Luftfeuchtigkeit", "bme280/humidity", "%", "humidity", "mdi:water-percent", "{{ value.split('|')[0] }}"},
+    {"sensor", "bme280_pressure", "Luftdruck", "bme280/pressure", "hPa", "pressure", "mdi:gauge", "{{ value.split('|')[0] }}"},
+    {"sensor", "bme280_barometer", "Barometerstand", "bme280/barometer", "", "", "mdi:trending-up", "{{ value.split('|')[0] | int }}"},
+    {"sensor", "bme280_dewpoint", "Taupunkt", "bme280/dewpoint", "°C", "temperature", "mdi:water", "{{ value.split('|')[0] }}"},
+    {"sensor", "bme280_warning", "Wetterwarnung", "bme280/warning", "", "", "mdi:alert", "{{ value.split('|')[0] | int }}"}
+  };
+
+  bool allSuccess = true;
+  int successCount = 0;
+
+  for (int i = 0; i < 6; i++) {
+    String configTopic = "homeassistant/" + String(sensors[i].component) + "/" + String(sensors[i].objectId) + "/config";
+    
+    String payload = "{\n";
+    payload += "  \"name\":\"" + String(sensors[i].name) + "\",\n";
+    payload += "  \"unique_id\":\"" + String(sensors[i].objectId) + "_" + WiFi.macAddress() + "\",\n";
+    payload += "  \"state_topic\":\"" + String(sensors[i].stateTopic) + "\",\n";
+    payload += "  \"value_template\":\"" + String(sensors[i].valueTemplate) + "\",\n";
+    
+    if (strlen(sensors[i].unit) > 0) {
+      payload += "  \"unit_of_measurement\":\"" + String(sensors[i].unit) + "\",\n";
+    }
+    if (strlen(sensors[i].deviceClass) > 0) {
+      payload += "  \"device_class\":\"" + String(sensors[i].deviceClass) + "\",\n";
+    }
+    if (strlen(sensors[i].icon) > 0) {
+      payload += "  \"icon\":\"" + String(sensors[i].icon) + "\",\n";
+    }
+    
+    payload += "  " + deviceJson + "\n";
+    payload += "}";
+
+    bool success = mqtt.publish(configTopic.c_str(), payload.c_str(), true);
+    
+    if (success) {
+      successCount++;
+    } else {
+      allSuccess = false;
+    }
+    
+    delay(100);
+  }
+
+  if (allSuccess) {
+    logMessage(LOG_INFO, MSG_HAOS_DISCOVERY_SUCCESS);
+  } else {
+    logMessage(LOG_ERROR, MSG_HAOS_DISCOVERY_FAILED);
+  }
+
+  return allSuccess;
+}
+
+// ═══════════════════════════════════════════════════════
+// MQTT Status API
+// ═══════════════════════════════════════════════════════
+void handleMQTTStatus() {
+  String json = "{";
+  json += "\"active\":" + String(cfg.mqttActive) + ",";
+  json += "\"status\":" + String((int)mqttStatus) + ",";
+  json += "\"message\":\"";
+
+  if (!cfg.mqttActive) {
+    json += "MQTT ist deaktiviert";
+  } else if (mqttStatus == MQTT_STATUS_CONNECTED) {
+    json += "Verbunden mit " + String(cfg.mqttBroker);
+  } else {
+    json += mqttLastError;
+  }
+
+  json += "\"}";
+
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.send(200, "application/json", json);
+}
+
+// ═══════════════════════════════════════════════════════
+// Log Count API
+// ═══════════════════════════════════════════════════════
+void handleLogStatus() {
+  String json = "{\"newLogs\":";
+  json += hasNewLogs ? "true" : "false";
+  json += "}";
+
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.send(200, "application/json", json);
+}
+
+// ═══════════════════════════════════════════════════════
+// Nutzungsbalken CPU/RAM/FLASH
+// ═══════════════════════════════════════════════════════
+String createProgressBar(uint8_t percent, String topLabel, String bottomLeft, String bottomRight) {
+  String bottom = (bottomLeft == "" && bottomRight == "") ? "" : 
+                  "<div class='progress-labels'><span>" + bottomLeft + "</span><span>" + bottomRight + "</span></div>";
+  
+  return "<div class='progress-container'>"
+         "<div class='progress-label-top'>" + topLabel + "</div>"
+         "<svg width='100%' height='20' viewBox='0 0 100 20' preserveAspectRatio='none' class='progress-bar' style='overflow:visible;'>"
+         "<rect width='100' height='10' fill='url(#progressGradient)' rx='1'/>"
+         "<use href='#marker' x='" + String(percent) + "' y='10'/>"
+         "</svg>" + bottom +
+         "</div>";
+}
+
+// ═══════════════════════════════════════════════════════
+// NEUES UI - HAUPTHANDLER MIT ALLEN 4 TABS
+// ═══════════════════════════════════════════════════════
+void handleRoot() {
+  // Sensordaten
+  float temp  = bme.readTemperature();
+  float hum   = bme.readHumidity();
+  float press = bme.readPressure() / 100.0f;
+  float dew   = dewPoint(temp, hum);
+
+  updateBarometer(press);
+  int trend   = calcBaroTrend();
+  int warning = calculateWeatherWarning(temp, hum, dew, trend);
+
+  String baroIconsStr = baroIcons(trend);
+  String warnIcon     = getWarningIcon(warning);
+  String warnText     = getWarningText(warning);
+
+  // Uptime
+  unsigned long uptimeSeconds = millis() / 1000;
+  unsigned long days = uptimeSeconds / 86400;
+  unsigned long hours = (uptimeSeconds % 86400) / 3600;
+  unsigned long mins = (uptimeSeconds % 3600) / 60;
+  String uptimeStr = String(days) + "d " + String(hours) + "h " + String(mins) + "m";
+
+  // System
+  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  String ip = wifiOk ? WiFi.localIP().toString() : String("nicht verbunden");
+  long rssi = wifiOk ? WiFi.RSSI() : 0;
+  
+  // Rohdaten auslesen
+  uint32_t freeHeap    = ESP.getFreeHeap();
+  uint32_t totalHeap   = 81920;
+  uint32_t usedHeap    = totalHeap - freeHeap;
+  uint32_t sketchSize  = ESP.getSketchSize();
+  uint32_t freeSketch  = ESP.getFreeSketchSpace();
+  uint32_t totalSketch = sketchSize + freeSketch;
+
+  // Prozente berechnen für Anzeige
+  uint8_t cpuUsedPct   = (uint8_t)(cpuUsage + 0.5f);
+  uint8_t ramUsedPct   = (uint8_t)((usedHeap * 100) / totalHeap);
+  uint8_t ramFreePct   = 100 - ramUsedPct;
+  uint8_t flashUsedPct = (uint8_t)((sketchSize * 100) / totalSketch);
+  uint8_t flashFreePct = 100 - flashUsedPct;
+
+  // Strings für Anzeige
+  String ramUsedKB     = String(usedHeap / 1024) + " kB";
+  String ramFreeKB     = String(freeHeap / 1024) + " kB";
+  String ramTotalKB    = String(totalHeap / 1024) + " kB";
+  String flashUsedKB   = String(sketchSize / 1024) + " kB";
+  String flashFreeKB   = String(freeSketch / 1024) + " kB";
+  String flashTotalMB  = String(totalSketch / 1048576.0f, 1) + " MB";
+
+  // MQTT Status
+  String mqttStatusText = "";
+  String mqttStatusClass = "";
+  if (cfg.mqttActive) {
+    if (mqttStatus == MQTT_STATUS_CONNECTED) {
+      mqttStatusText = "Verbunden";
+      mqttStatusClass = "status-connected";
+    } else {
+      mqttStatusText = mqttLastError;
+      mqttStatusClass = "status-disconnected";
+    }
+  } else {
+    mqttStatusText = "Deaktiviert";
+    mqttStatusClass = "status-disabled";
+  }
+
+  // ===== CHUNKED SENDING START =====
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "text/html", "");
+  
+    // Chunk 1: HTML Head + CSS
+  String chunk = "<!DOCTYPE html><html lang='de'><head>";
+  chunk += "<meta charset='UTF-8'>";
+  chunk += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  chunk += "<title>Wetter•Freund</title><style>";
+  chunk += "*{margin:0;padding:0;box-sizing:border-box;}";
+  chunk += "html{scrollbar-gutter:stable;}";
+  chunk += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f5f7;color:#1d1d1f;transition:background 0.3s,color 0.3s;}";
+  chunk += "body[data-theme='dark']{background:#1e1e2e;color:#e2e8f0;}";
+  chunk += "body[data-theme='dark'] .app-container{box-shadow:0 4px 24px rgba(0,0,0,0.4);}";
+  chunk += "body[data-theme='dark'] .header{background:linear-gradient(135deg,#5b4fc4 0%,#7f72f0 100%);}";
+  chunk += "body[data-theme='dark'] .nav-tabs{background:#2a2a3e;border-bottom-color:#3a3a52;}";
+  chunk += "body[data-theme='dark'] .nav-tabs a{color:#94a3b8;}";
+  chunk += "body[data-theme='dark'] .nav-tabs a:hover{background:rgba(127,114,240,0.1);color:#a29bfe;}";
+  chunk += "body[data-theme='dark'] .nav-tabs a.active{color:#a29bfe;border-bottom-color:#a29bfe;}";
+  chunk += "body[data-theme='dark'] .content{background:#2a2a3e;}";
+  chunk += "body[data-theme='dark'] .preview-card{background:#1e1e2e;border:1px solid #3a3a52;}";
+  chunk += "body[data-theme='dark'] .data-item{background: rgba(255,255,255,0.05);border: 1px solid #444;border-radius: 8px;padding: 16px;box-shadow: 0 2px 4px rgba(0,0,0,0.3);}";
+  chunk += "body[data-theme='dark'] .data-label{color:#94a3b8;}";
+  chunk += "body[data-theme='dark'] .preview-card h2,body[data-theme='dark'] fieldset legend{color:#e2e8f0;}";
+  chunk += "body[data-theme='dark'] table{border-color:#3a3a52;}";
+  chunk += "body[data-theme='dark'] th{background:#2a2a3e;color:#e2e8f0;border-color:#3a3a52;}";
+  chunk += "body[data-theme='dark'] td{background:#1e1e2e;color:#e2e8f0;border-color:#3a3a52;}";
+  chunk += "body[data-theme='dark'] input[type='text'],body[data-theme='dark'] input[type='number'],body[data-theme='dark'] input[type='password']{background:#1e1e2e;border-color:#3a3a52;color:#e2e8f0;}";
+  chunk += "body[data-theme='dark'] fieldset{background:#1e1e2e;border-color:#3a3a52;}";
+  chunk += "body[data-theme='dark'] label{color:#94a3b8;}";
+  webServer.sendContent(chunk);
+  chunk = "";
+  
+  // Chunk 2: CSS Container/Layout
+  chunk += ".app-container{max-width:900px;margin:0 auto;background:white;box-shadow:0 2px 16px rgba(0,0,0,0.1);overflow:hidden;}";
+  chunk += ".header{background:linear-gradient(135deg,#6c5ce7 0%,#a29bfe 100%);color:white;padding:20px 20px 16px;}";
+  chunk += ".header-content{display:flex;align-items:center;gap:16px;}";
+  chunk += ".logo{width:100px;height:60px;overflow:hidden;position:relative;}";
+  chunk += ".logo svg{width:200%;height:200%;position:absolute;top:-30px;left:-10px;}";
+  chunk += ".device-info{flex:1;}";
+  chunk += ".device-name{font-size:32px;font-weight:700;letter-spacing:1px;margin-bottom:4px;}";
+  chunk += ".device-name .bullet{font-weight:700;font-size:28px;margin:0 2px;}";
+  chunk += ".device-subtitle{font-size:13px;opacity:0.85;font-weight:700;letter-spacing:0.5px;}";
+  chunk += ".status-bar{display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.2);font-size:12px;}";
+  chunk += ".status-indicator{display:flex;align-items:center;gap:6px;}";
+  chunk += ".status-dot{width:8px;height:8px;border-radius:50%;background:#00d084;box-shadow:0 0 8px rgba(0,208,132,0.6);animation:pulse 2s ease-in-out infinite;}";
+  chunk += "@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.5;}}";
+  chunk += ".theme-toggle{background:rgba(255,255,255,0.2);border:none;color:white;padding:6px 12px;border-radius:20px;cursor:pointer;font-size:12px;transition:background 0.3s;}";
+  chunk += ".theme-toggle:hover{background:rgba(255,255,255,0.3);}";
+  webServer.sendContent(chunk);
+  chunk = "";
+  
+  // Chunk 3: CSS Navigation/Content
+  chunk += ".nav-tabs{display:flex;background:white;border-bottom:1px solid #e5e5e7;position:sticky;top:0;z-index:100;}";
+  chunk += ".nav-tabs a{flex:1;text-align:center;padding:16px 12px;text-decoration:none;color:#86868b;font-size:14px;font-weight:500;border-bottom:2px solid transparent;transition:all 0.2s ease;cursor:pointer;}";
+  chunk += ".nav-tabs a:hover{color:#6c5ce7;background:#fafafa;}";
+  chunk += ".nav-tabs a.active{color:#6c5ce7;border-bottom-color:#6c5ce7;}";
+  chunk += ".content{background:white;padding:24px 16px;min-height:400px;}";
+  chunk += ".tab-content{display:none;}";
+  chunk += ".tab-content.active{display:block;}";
+  chunk += ".preview-card{background:white;border-radius:12px;padding:24px;margin-bottom:20px;}";
+  chunk += ".preview-card h2{font-size:18px;font-weight:600;margin-bottom:20px;color:#1d1d1f;}";
+  chunk += ".data-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));max-width:600px;margin:20px auto 0;gap:16px;}";
+  chunk += ".data-item{background: rgba(255,255,255,0.05);border: 1px solid #444;border-radius: 8px;padding: 16px;box-shadow: 0 2px 4px rgba(0,0,0,0.3);}";
+  chunk += ".data-label{font-size:12px;color:#86868b;margin-bottom:6px;}";
+  chunk += ".data-value{font-size:28px;font-weight:600;color:#6c5ce7;}";
+  chunk += ".data-unit{font-size:14px;font-weight:400;color:#86868b;margin-left:4px;}";
+  chunk += ".reload-info{text-align:center;margin-top:24px;font-size:12px;color:#86868b;}";
+  webServer.sendContent(chunk);
+  chunk = "";
+  
+  // Chunk 4: CSS Tables/Forms
+  chunk += "table{border-collapse:collapse;width:100%;margin:20px 0;}";
+  chunk += "th,td{border:1px solid #e5e5e7;padding:12px;text-align:left;}";
+  chunk += "th{background:#f5f5f7;font-weight:600;font-size:14px;}";
+  chunk += "td{font-size:14px;}";
+  chunk += "fieldset{margin:20px 0;padding:20px;border:1px solid #e5e5e7;border-radius:8px;background:#fafafa;}";
+  chunk += "legend{padding:0 8px;font-weight:600;color:#1d1d1f;font-size:16px;}";
+  chunk += "label{display:block;margin:12px 0 6px;font-size:14px;font-weight:500;}";
+  chunk += "input[type='text'],input[type='number'],input[type='password']{width:100%;max-width:400px;padding:10px;border:1px solid #d1d1d6;border-radius:8px;font-size:14px;font-family:monospace;}";
+  chunk += "input[type='checkbox']{margin-right:8px;}";
+  chunk += "input[type='submit'],button{background:#6c5ce7;color:white;padding:10px 20px;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500;margin-top:12px;}";
+  chunk += "input[type='submit']:hover,button:hover{background:#5b4fc4;}";
+  chunk += ".btn-danger{background:#dc3545;}";
+  chunk += ".btn-danger:hover{background:#c82333;}";
+  chunk += ".status-connected{background:#d4edda;color:#155724;padding:4px 10px;border-radius:12px;font-size:11px;display:inline-block;}";
+  chunk += ".status-disconnected{background:#f8d7da;color:#721c24;padding:4px 10px;border-radius:12px;font-size:11px;display:inline-block;}";
+  chunk += ".status-disabled{background:#e2e3e5;color:#383d41;padding:4px 10px;border-radius:12px;font-size:11px;display:inline-block;}";
+  chunk += ".log-info{color:#0066cc;font-weight:bold;}";
+  chunk += ".log-warn{color:#ff8800;font-weight:bold;}";
+  chunk += ".log-error{color:#cc0000;font-weight:bold;}";
+  chunk += ".timestamp{color:#666;font-size:12px;}";
+  chunk += ".mqtt-table{width:100%;margin:10px 0;}";
+  chunk += ".mqtt-table th,.mqtt-table td{text-align:center;padding:8px;}";
+  chunk += ".mqtt-table td:first-child{text-align:left;}";
+  chunk += ".progress-container{margin:4px 0;}";
+  chunk += ".progress-label-top{text-align:center;font-size:11px;font-weight:600;margin-bottom:6px;}";
+  chunk += ".progress-bar{display:block;margin:8px 0;}";
+  chunk += ".progress-labels{display:flex;justify-content:space-between;margin-top:6px;font-size:10px;color:#86868b;}";
+  chunk += ".progress-labels span:last-child{text-align:right;}";
+  chunk += "body[data-theme='dark'] .progress-labels{color:#94a3b8;}";
+  chunk += "#marker{fill:#1d1d1f;}";
+  chunk += "body[data-theme='dark'] #marker{fill:#e2e8f0;}";
+  chunk += "@media (max-width:920px){.app-container{margin:0;box-shadow:none;}}";
+  chunk += "@media (max-width:600px){.nav-tabs a{font-size:12px;padding:14px 8px;}.data-grid{grid-template-columns:1fr;}}";
+  chunk += "@media (max-width:580px){.header-content{flex-direction:column;text-align:center;gap:12px;}.logo,.powered-by-logo{margin:0 auto;}.header-content>div:first-child{display:flex;gap:20px;justify-content:center;align-items:center;}.device-info{text-align:center;}.device-name{font-size:28px;}.device-subtitle{font-size:12px;}}";
+  chunk += "</style>";
+  webServer.sendContent(chunk);
+  chunk = "";
+  
+  // Chunk 5: JavaScript
+  chunk += "<script>";
+
+  // Tabs umschalten + Polling steuern
+  chunk += "let updateInterval=null;";
+  chunk += "let currentTab='daten';";
+  chunk += "let isReloading=false;";
+
+  chunk += "function showTab(t,e){";
+  chunk += "document.querySelectorAll('.nav-tabs a').forEach(x=>x.classList.remove('active'));";
+  chunk += "e.classList.add('active');";
+  chunk += "currentTab=t;";
+  chunk += "localStorage.setItem('activeTab',t);";
+  chunk += "stopAutoUpdate();";
+  chunk += "fetch('/tab/'+t).then(r=>r.text()).then(html=>{";
+  chunk += "document.getElementById('tab-container').innerHTML=html;";
+  chunk += "if(t==='daten'){startAutoUpdate();}";
+  chunk += "}).catch(e=>console.error('Tab-Laden fehlgeschlagen:',e));";
+  chunk += "}";
+
+  // Daten-Update per JSON
+  chunk += "function updateData(){";
+  chunk += "if(currentTab!=='daten')return;";
+  chunk += "fetch('/json').then(r=>r.json()).then(d=>{";
+  chunk += "document.getElementById('val-temp').innerHTML=(d.temperature.value!==null?parseFloat(d.temperature.value).toFixed(1):'-')+\"<span class='data-unit'>°C</span>\";";
+  chunk += "document.getElementById('val-hum').innerHTML=(d.humidity.value!==null?parseFloat(d.humidity.value).toFixed(0):'-')+\"<span class='data-unit'>%</span>\";";
+  chunk += "document.getElementById('val-press').innerHTML=(d.pressure.value!==null?parseFloat(d.pressure.value).toFixed(0):'-')+\"<span class='data-unit'>hPa</span>\";";
+  chunk += "document.getElementById('val-dew').innerHTML=(d.dewpoint.value!==null?parseFloat(d.dewpoint.value).toFixed(1):'-')+\"<span class='data-unit'>°C</span>\";";
+  chunk += "document.getElementById('val-pressAvg').innerHTML=(d.pressureAvg.current!=='null'?parseFloat(d.pressureAvg.current).toFixed(1):'-')+\"<span class='data-unit'>hPa</span>\";";
+  chunk += "document.getElementById('val-pressAvg1h').innerHTML=(d.pressureAvg.minus1h!=='null'?parseFloat(d.pressureAvg.minus1h).toFixed(1):'-')+\"<span class='data-unit'>hPa</span>\";";
+  chunk += "document.getElementById('val-pressAvg2h').innerHTML=(d.pressureAvg.minus2h!=='null'?parseFloat(d.pressureAvg.minus2h).toFixed(1):'-')+\"<span class='data-unit'>hPa</span>\";";
+
+  // Barometer mit farbigen Punkten
+  chunk += "let trend=d.barometer.value;";
+  chunk += "if(trend<-3)trend=-3;";
+  chunk += "if(trend>3)trend=3;";
+  chunk += "const colored=['\\uD83D\\uDD34','\\uD83D\\uDFE0','\\uD83D\\uDFE1','\\uD83D\\uDD35','\\uD83D\\uDFE1','\\uD83D\\uDFE0','\\uD83D\\uDD34'];";
+  chunk += "const gray='\\u26AA\\uFE0F';";
+  chunk += "const center=3;";
+  chunk += "const active=center+trend;";
+  chunk += "let baroDisplay='\\u2796 ';";
+  chunk += "const baroReady=(d.barometer.value!==-999);";
+  chunk += "for(let i=0;i<7;i++){";
+  chunk += "const isCenter=(i===center);";
+  chunk += "const isActive=(i===active);";
+  chunk += "if(baroReady){";
+  chunk += "if(isCenter||isActive){baroDisplay+=colored[i];}else{baroDisplay+=gray;}";
+  chunk += "}else{";
+  chunk += "baroDisplay+=gray;";
+  chunk += "}";
+  chunk += "if(i<6)baroDisplay+=' ';";
+  chunk += "}";
+  chunk += "baroDisplay+=' \\u2795';";
+
+  // Einstellung für Größe der Dots
+  chunk += "document.getElementById('val-baro').innerHTML='<span style=\"font-size:1em;\">'+baroDisplay+'</span>';";
+  chunk += "document.getElementById('val-warn').innerHTML=d.warning.value===1?'⚠️':'-';";
+
+  // Standort nur 4-stellig
+  chunk += "document.getElementById('val-lon').innerHTML=parseFloat(d.location.longitude).toFixed(4)+\"<span class='data-unit'>°</span>\";";
+  chunk += "document.getElementById('val-lat').innerHTML=parseFloat(d.location.latitude).toFixed(4)+\"<span class='data-unit'>°</span>\";";
+  chunk += "document.getElementById('val-alt').innerHTML=parseFloat(d.location.altitude.value).toFixed(1)+\"<span class='data-unit'>m</span>\";";
+  chunk += "}).catch(e=>console.error('Update fehlgeschlagen:',e));";
+  chunk += "}";
+
+  chunk += "function startAutoUpdate(){";
+  chunk += "if(updateInterval)return;";
+  chunk += "updateData();";
+  chunk += "updateInterval=setInterval(updateData,5000);";
+  chunk += "}";
+
+  chunk += "function stopAutoUpdate(){";
+  chunk += "if(updateInterval){clearInterval(updateInterval);updateInterval=null;}";
+  chunk += "}";
+
+  // Dark/Light-Theme mit System-Option
+  chunk += "function toggleTheme(){";
+  chunk += "const useSystem=localStorage.getItem('themeSystem')==='true';";
+  chunk += "if(useSystem)return;";
+  chunk += "const b=document.body;";
+  chunk += "const t=b.getAttribute('data-theme')==='dark'?'light':'dark';";
+  chunk += "b.setAttribute('data-theme',t);";
+  chunk += "localStorage.setItem('theme',t);";
+  chunk += "}";
+
+  chunk += "function setSystemTheme(enabled){";
+  chunk += "localStorage.setItem('themeSystem',enabled);";
+  chunk += "if(enabled){";
+  chunk += "const prefersDark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;";
+  chunk += "const theme=prefersDark?'dark':'light';";
+  chunk += "document.body.setAttribute('data-theme',theme);";
+  chunk += "}";
+  chunk += "}";
+
+  // MQTT Retain-Checkbox-Logik
+  chunk += "function toggleRetain(idx){";
+  chunk += "var sendBox=document.getElementById('send'+idx);";
+  chunk += "var retBox=document.getElementById('ret'+idx);";
+  chunk += "if(!sendBox.checked){retBox.checked=false;retBox.disabled=true;}";
+  chunk += "else{retBox.disabled=false;}";
+  chunk += "}";
+
+  // MQTT-Status Polling
+  chunk += "function updateMQTTStatus(){";
+  chunk += "fetch('/api/mqtt-status').then(r=>r.json()).then(d=>{";
+  chunk += "var badge=document.getElementById('mqtt-status-badge');";
+  chunk += "if(!badge)return;";
+  chunk += "badge.className='';";
+  chunk += "if(d.active==0){badge.className='status-disabled';badge.innerText='Deaktiviert';}";
+  chunk += "else if(d.status==2){badge.className='status-connected';badge.innerText='Verbunden';}";
+  chunk += "else{badge.className='status-disconnected';badge.innerText='Getrennt';}";
+  chunk += "});";
+  chunk += "}";
+
+  // Formular-Handler
+  chunk += "function handleFormSubmit(form,btn){";
+  chunk += "const originalText=btn.value;";
+  chunk += "btn.style.background='#e74c3c';";
+  chunk += "btn.value='Speichere...';";
+  chunk += "btn.disabled=true;";
+  chunk += "fetch(form.action,{method:'POST',body:new FormData(form)})";
+  chunk += ".then(r=>r.json())";
+  chunk += ".then(d=>{";
+  chunk += "btn.style.background='#27ae60';";
+  chunk += "btn.value='✓ Gespeichert';";
+  chunk += "setTimeout(function(){";
+  chunk += "btn.style.background='';";
+  chunk += "btn.value=originalText;";
+  chunk += "btn.disabled=false;";
+  chunk += "},3000);";
+  chunk += "})";
+  chunk += ".catch(e=>{";
+  chunk += "btn.style.background='#e74c3c';";
+  chunk += "btn.value='✗ Fehler';";
+  chunk += "setTimeout(function(){";
+  chunk += "btn.style.background='';";
+  chunk += "btn.value=originalText;";
+  chunk += "btn.disabled=false;";
+  chunk += "},3000);";
+  chunk += "});";
+  chunk += "return false;";
+  chunk += "}";
+
+  // OTA Upload Handler (global, damit er auch nach Tab-Wechsel funktioniert)
+  chunk += "function handleOTAUpload(e){";
+  chunk += "e.preventDefault();";
+  chunk += "var form=document.getElementById('otaForm');";
+  chunk += "var fileInput=document.getElementById('otaFile');";
+  chunk += "if(!fileInput.files[0]){alert('Bitte Datei auswählen!');return false;}";
+  chunk += "var formData=new FormData(form);";
+  chunk += "var xhr=new XMLHttpRequest();";
+  chunk += "var progressDiv=document.getElementById('otaProgress');";
+  chunk += "var bar=document.getElementById('otaBar');";
+  chunk += "var text=document.getElementById('otaText');";
+  chunk += "progressDiv.style.display='block';";
+  chunk += "bar.style.background='#007bff';";
+  chunk += "bar.style.width='0%';";
+  chunk += "text.innerHTML='0%';";
+  chunk += "xhr.upload.onprogress=function(evt){";
+  chunk += "if(evt.lengthComputable){";
+  chunk += "var pct=Math.round((evt.loaded/evt.total)*100);";
+  chunk += "bar.style.width=pct+'%';";
+  chunk += "text.innerHTML='Upload: '+pct+'%';";
+  chunk += "}};";
+  chunk += "xhr.onload=function(){";
+  chunk += "if(xhr.status===200){";
+  chunk += "bar.style.background='#fc0';";
+  chunk += "var countdown=60;";
+  chunk += "bar.style.width='100%';";
+  chunk += "var timer=setInterval(function(){";
+  chunk += "countdown--;";
+  chunk += "var pct=Math.round((countdown/60)*100);";
+  chunk += "bar.style.width=pct+'%';";
+  chunk += "text.innerHTML='Einrichtung: noch '+countdown+' Sekunden';";
+  chunk += "if(countdown<=0){clearInterval(timer);location.reload();}";
+  chunk += "},1000);";
+  chunk += "}else{";
+  chunk += "bar.style.background='#dc3545';";
+  chunk += "text.innerHTML='Upload fehlgeschlagen!';";
+  chunk += "}};";
+  chunk += "xhr.open('POST','/update');";
+  chunk += "xhr.send(formData);";
+  chunk += "return false;";
+  chunk += "}";
+
+  // Initialisierung beim Laden
+  chunk += "window.onload=function(){";
+  chunk += "const useSystem=localStorage.getItem('themeSystem')==='true';";
+  chunk += "const systemCheckbox=document.getElementById('themeSystemCheck');";
+  chunk += "if(useSystem){";
+  chunk += "if(systemCheckbox)systemCheckbox.checked=true;";
+  chunk += "const prefersDark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;";
+  chunk += "document.body.setAttribute('data-theme',prefersDark?'dark':'light');";
+  chunk += "}else{";
+  chunk += "const savedTheme=localStorage.getItem('theme')||'light';";
+  chunk += "document.body.setAttribute('data-theme',savedTheme);";
+  chunk += "}";
+  chunk += "const savedTab=localStorage.getItem('activeTab')||'daten';";
+  chunk += "const tabLink=document.querySelector('[onclick*=\"'+savedTab+'\"]');";
+  chunk += "if(tabLink){showTab(savedTab,tabLink);}";
+  chunk += "for(var i=0;i<6;i++){if(document.getElementById('send'+i))toggleRetain(i);}";
+  chunk += "updateMQTTStatus();";
+  chunk += "setInterval(updateMQTTStatus,10000);";
+  chunk += "};";
+  chunk += "</script></head>";
+  chunk += "<body>";
+  chunk += "<svg width='0' height='0' style='position:absolute;'>"
+           "<defs>"
+           "<linearGradient id='progressGradient' x1='0%' y1='0%' x2='100%' y2='0%'>"
+           "<stop offset='0%' style='stop-color:#22c55e;stop-opacity:1'/>"
+           "<stop offset='60%' style='stop-color:#eab308;stop-opacity:1'/>"
+           "<stop offset='75%' style='stop-color:#f97316;stop-opacity:1'/>"
+           "<stop offset='90%' style='stop-color:#ef4444;stop-opacity:1'/>"
+           "<stop offset='100%' style='stop-color:#ef4444;stop-opacity:1'/>"
+           "</linearGradient>"
+           "<polygon id='marker' points='0,0 1,7 -1,7'/>"
+           "</defs>"
+           "</svg>";
+  chunk += "<div class='app-container'>";
+  webServer.sendContent(chunk);
+  chunk = "";
+
+////////////////////////////////////////////////
+// Start Website
+////////////////////////////////////////////////
+
+// Chunk 6: Header mit Logo
+  chunk += "<header class='header'><div class='header-content'><div class='logo'>";
+  chunk += "<svg viewBox='0 0 1683 1190' preserveAspectRatio='xMidYMid'>";
+  chunk += "<path d='M166.5,399.1c-8.8,0.4-19.4,1.4-23.6,2.3c-17,3.6-30.5,11-42.9,23.6c-13.2,13.4-20.3,27.6-23.7,47.8c-1.4,8.5-1.7,25.7-2,143.2c-0.5,165.4-0.1,178.2,7.3,196.6c11.3,28.6,35.6,47.7,66.7,52.6c6.6,1,70.2,1.3,327.2,1.3h319l9.6-2.1c10.2-2.3,23.5-8,31.6-13.5c16-11,28.3-28.8,33.3-48.2c3.9-15.4,4.1-28,3.7-179.7c-0.4-160.7-0.1-152.8-6.8-169.7c-8.5-21.4-25.1-38.4-46.3-47.2c-11.1-4.6-20-6.1-42.1-7.1c-23.8-1.1-587.7-1-611,0.1z' fill='none' stroke='#fff' stroke-width='35'/>";
+  chunk += "<circle cx='380' cy='580' r='80' fill='#fff'/>";
+  chunk += "<rect x='557' y='488' width='146' height='153' fill='#fc0'/>";
+  chunk += "<path d='M456.5,707.9c42.6,10.8,76.1,27.2,97.1,47.3c12.3,11.8,21.2,26.1,23,37l0.7,3.8H801V705l-177.7,0.1H445.5Z' fill='#fc0'/>";
+  chunk += "<path d='M317.5,711.1c-83.4,6.6-153.1,36.2-171.3,72.8c-2.3,4.6-4.2,9.2-4.2,10.2c0,1.9,5,1.9,210.6,1.9h210.6l-0.7-2.8C560.2,783.8,551.4,771,541.1,762.3C511.5,737.1,462.3,719.6,401,712.4c-16.3-1.9-66.3-2.7-83.5-1.3z' fill='#fff'/>";
+  chunk += "</svg></div>";
+  chunk += "<div class='device-info'>";
+  chunk += "<div class='device-name'>Wetter<span class='bullet'>•</span>Freund <span class='device-subtitle'> V2.0</span></div>";
+  chunk += "<div class='device-subtitle'>ESP-02S | BME280</div></div>";
+  chunk += "<div class='powered-by-logo'>";
+  chunk += "<svg viewBox='0 0 230 60' width='180' height='48'>";
+  chunk += "<rect x='0' y='0' width='230' height='60' fill='#FFFFFF'/>";
+  chunk += "<rect x='0' y='12' width='6' height='15' fill='#FFFFFF'/>";
+  chunk += "<rect x='10' y='12' width='6' height='15' fill='#000000'/>";
+  chunk += "<rect x='0' y='27' width='6' height='15' fill='#FFFFFF'/>";
+  chunk += "<rect x='10' y='27' width='6' height='15' fill='#DD0000'/>";
+  chunk += "<rect x='0' y='42' width='6' height='15' fill='#FFFFFF'/>";
+  chunk += "<rect x='10' y='42' width='6' height='15' fill='#FFCE00'/>";
+  chunk += "<text x='25' y='25' font-family='Helvetica, sans-serif' font-size='14' font-weight='700' font-style='italic'>";
+  chunk += "<tspan fill='#CCCCCC'>I</tspan><tspan fill='#888888'>I</tspan><tspan fill='#444444'>I</tspan><tspan fill='#000000'>Powered By</tspan>";
+  chunk += "</text>";
+  chunk += "<text x='25' y='50' font-family='Helvetica, sans-serif' font-size='24' fill='#000000' font-weight='700'>";
+  chunk += "Deutschland<tspan fill='#00A651'>GPT</tspan>";
+  chunk += "</text>";
+  chunk += "</svg></div></div>";
+  chunk += "<div class='status-bar'><div>" + getTimeString() + "</div>";
+  chunk += "<div style='display:flex;gap:12px;align-items:center;'>";
+  chunk += "</div></div>";
+  chunk += "</header>";
+  webServer.sendContent(chunk);
+  chunk = "";
+
+  // Chunk 7: Navigation
+  chunk += "<nav class='nav-tabs'>";
+  chunk += "<a class='active' onclick='showTab(\"daten\",this)'>Daten</a>";
+  chunk += "<a onclick='showTab(\"einstellungen\",this)'>Einstellungen</a>";
+  chunk += "<a onclick='showTab(\"system\",this)'>System</a>";
+  chunk += "<a onclick='showTab(\"logs\",this)'>Logs</a>";
+  chunk += "</nav><main class='content'>";
+  chunk += "<div id='tab-container'></div>";  // ← Nur noch dieser Container!
+  chunk += "</main></div></body></html>";
+  webServer.sendContent(chunk);
+  webServer.sendContent("");
+}
+
+// ═══════════════════════════════════════════════════════
+// TAB: Daten (dynamisch geladen)
+// ═══════════════════════════════════════════════════════
+void handleTabDaten() {
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "text/html", "");
+
+  String chunk = "";
+
+  // Chunk 8: TAB DATEN (aus der alten handleRoot kopieren!)
+  chunk += "<div id='tab-daten' class='tab-content active'>";
+  chunk += "<div class='preview-card'><fieldset><legend>Aktuelle Messwerte</legend><div class='data-grid'>";
+  chunk += "<div class='data-item'><div class='data-label'>Temperatur</div>";
+  chunk += "<div class='data-value' id='val-temp'>-<span class='data-unit'>°C</span></div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>Luftfeuchtigkeit</div>";
+  chunk += "<div class='data-value' id='val-hum'>-<span class='data-unit'>%</span></div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>Luftdruck</div>";
+  chunk += "<div class='data-value' id='val-press'>-<span class='data-unit'>hPa</span></div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>ø-Luftdruck</div>";
+  chunk += "<div class='data-value' id='val-pressAvg'>-<span class='data-unit'>hPa</span></div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>ø-Luftdruck -1h</div>";
+  chunk += "<div class='data-value' id='val-pressAvg1h'>-<span class='data-unit'>hPa</span></div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>ø-Luftdruck -2h</div>";
+  chunk += "<div class='data-value' id='val-pressAvg2h'>-<span class='data-unit'>hPa</span></div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>Barometer</div>";
+  chunk += "<div class='data-value' id='val-baro' style='font-size:10px;line-height:3;'>-</div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>Taupunkt</div>";
+  chunk += "<div class='data-value' id='val-dew'>-<span class='data-unit'>°C</span></div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>Wetterwarnung</div>";
+  chunk += "<div class='data-value' id='val-warn' style='font-size:32px;'>-</div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>Längenkoordinate</div>";
+  chunk += "<div class='data-value' id='val-lon' style='font-size:32px;'>-<span class='data-unit'>°</span></div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>Breitenkoordinate</div>";
+  chunk += "<div class='data-value' id='val-lat' style='font-size:32px;'>-<span class='data-unit'>°</span></div></div>";
+  chunk += "<div class='data-item'><div class='data-label'>Höhe NN</div>";
+  chunk += "<div class='data-value' id='val-alt'>-<span class='data-unit'>m</span></div></div>";
+  chunk += "</div></fieldset><div class='reload-info'>ℹ️ Auto-Update alle 5 Sekunden</div></div></div>";
+
+  webServer.sendContent(chunk);
+  webServer.sendContent("");
+}
+
+// ═══════════════════════════════════════════════════════
+// TAB: Einstellungen (dynamisch geladen)
+// ═══════════════════════════════════════════════════════
+void handleTabEinstellungen() {
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "text/html", "");
+
+  String chunk = "";
+
+  // Chunk 9: Theme & WLAN (aus der alten handleRoot kopieren!)
+  chunk += "<div id='tab-einstellungen' class='tab-content active'><div class='preview-card'>";
+  chunk += "<fieldset><legend>Darstellung</legend>";
+  chunk += "<button type='button' onclick='toggleTheme()' style='margin-top:12px;'>🌓 Theme umschalten</button>";
+  chunk += "<label><input type='checkbox' id='themeSystemCheck' onchange='setSystemTheme(this.checked)'> System folgen</label>";
+  chunk += "</fieldset>";
+  chunk += "<form action='/saveWifi' method='POST'>";
+  chunk += "<fieldset><legend>WLAN Verbindung</legend>";
+  chunk += "<label>SSID:<br><input type='text' name='ssid' value='" + String(cfg.ssid) + "' maxlength='32'></label>";
+  chunk += "<label>Passwort:<br><input type='password' name='pass' value='" + String(cfg.pass) + "' maxlength='64'></label>";
+  chunk += "<p style='font-size:12px;color:#666;margin-top:8px;'><em>ℹ️ Leer = AP-Modus beim nächsten Start</em></p>";
+  chunk += "<input type='submit' value='WLAN Speichern & Neustart'>";
+  chunk += "</fieldset></form>";
+  webServer.sendContent(chunk);
+  chunk = "";
+
+  // Chunk 10: MQTT
+  String mqttStatusText = "";
+  String mqttStatusClass = "";
+  if (cfg.mqttActive) {
+    if (mqttStatus == MQTT_STATUS_CONNECTED) {
+      mqttStatusText = "Verbunden";
+      mqttStatusClass = "status-connected";
+    } else {
+      mqttStatusText = mqttLastError;
+      mqttStatusClass = "status-disconnected";
+    }
+  } else {
+    mqttStatusText = "Deaktiviert";
+    mqttStatusClass = "status-disabled";
+  }
+
+  chunk += "<form action='/saveMqtt' method='POST' onsubmit='return handleFormSubmit(this,this.querySelector(\"input[type=submit]\"))'>";
+  chunk += "<fieldset><legend>MQTT Broker <span id='mqtt-status-badge' class='" + mqttStatusClass + "'>" + mqttStatusText + "</span></legend>";
+  chunk += "<label><input type='checkbox' name='active' " + String(cfg.mqttActive ? "checked" : "") + "> MQTT aktivieren</label>";
+  chunk += "<label>Broker (IP:Port):<br><input type='text' name='broker' value='" + String(cfg.mqttBroker) + "' maxlength='64' placeholder='192.168.1.100:1883'></label>";
+  chunk += "<label>User:<br><input type='text' name='user' value='" + String(cfg.mqttUser) + "' maxlength='32'></label>";
+  chunk += "<label>Passwort:<br><input type='password' name='pass' value='" + String(cfg.mqttPass) + "' maxlength='64'></label>";
+  chunk += "<p style='font-size:12px;color:#666;margin-top:8px;'><em>ℹ️ Leer = anonyme Anmeldung - wenn der Broker es erlaubt</em></p>";
+  webServer.sendContent(chunk);
+  chunk = "";
+
+  // Chunk 11: MQTT Parameter Tabelle
+  chunk += "<h3 style='margin-top:20px;'>MQTT Parameter:</h3>";
+  chunk += "<table class='mqtt-table'>";
+  chunk += "<tr><th>Parameter</th><th>Senden</th><th>Speichern</th></tr>";
+
+  const char* labels[10] = {"Temperatur","Luftfeuchtigkeit","Luftdruck","Barometerstand","Taupunkt","Warnung","Log","Breitengrad","Längengrad","Höhe"};
+
+  for (int i = 0; i < 7; i++) {
+    bool send = (cfg.mqttParams[i] >= 1);
+    bool retain = (cfg.mqttParams[i] == 2);
+
+    chunk += "<tr><td>" + String(labels[i]) + "</td>";
+    chunk += "<td><input type='checkbox' id='send" + String(i) + "' name='send" + String(i) + "' onchange='toggleRetain(" + String(i) + ")' " + (send ? "checked" : "") + "></td>";
+    chunk += "<td><input type='checkbox' id='ret" + String(i) + "' name='ret" + String(i) + "' " + (retain ? "checked" : "") + "></td>";
+    chunk += "</tr>";
+  }
+
+  chunk += "</table>";
+  chunk += "<p style='font-size:12px;color:#666;'><em>ℹ️ Speichern = Retain-Flag (Speicherung auf dem Broker) | MQTT-Log nur alle 60s zusammen mit den Daten!</em></p>";
+  chunk += "<div style='display:flex;gap:20px;align-items:flex-start;margin-top:12px;'>";
+  chunk += "<input type='submit' value='MQTT Speichern'>";
+  chunk += "<div>";
+  chunk += "<label><input type='checkbox' name='haosDiscovery'> An Home Assistant melden</label>";
+  chunk += "<p style='font-size:11px;color:#666;margin-top:4px;margin-bottom:0;'><em>ℹ️ Nur bei Ersteinrichtung setzen</em></p>";
+  chunk += "</div></div>";
+  chunk += "</fieldset></form>";
+  webServer.sendContent(chunk);
+  chunk = "";
+
+  // Chunk 12: Standort + Logging
+  chunk += "<form action='/saveLocation' method='POST' onsubmit='return handleFormSubmit(this,this.querySelector(\"input[type=submit]\"))'>";
+  chunk += "<fieldset><legend>Standort</legend>";
+  chunk += "<label>Höhe (m):<br><input type='text' name='alt' value='" + String(cfg.altitude, 0) + "' placeholder='120'></label>";
+  chunk += "<label>Breitengrad:<br><input type='text' name='lat' value='" + String(cfg.latitude, 6) + "' placeholder='52.520000'>";
+  chunk += "<p style='font-size:11px;color:#666;margin-top:4px;'>Dezimalgrad (positiv = N, negativ = S)</p></label>";
+  chunk += "<label>Längengrad:<br><input type='text' name='lon' value='" + String(cfg.longitude, 6) + "' placeholder='13.405000'>";
+  chunk += "<p style='font-size:11px;color:#666;margin-top:4px;'>Dezimalgrad (positiv = O, negativ = W)</p></label>";
+  chunk += "<p style='font-size:12px;color:#666;margin-bottom:12px;'><em>ℹ️ Koordinaten mit 6 Nachkommastellen (mit 0 auffüllen), Trennzeichen: Punkt (.)</em></p>";
+  chunk += "<input type='submit' value='Standort Speichern'>";
+  chunk += "</fieldset></form>";
+  chunk += "<form action='/saveLogging' method='POST' onsubmit='return handleFormSubmit(this,this.querySelector(\"input[type=submit]\"))'>";
+  chunk += "<fieldset><legend>Logging</legend>";
+  chunk += "<label><input type='checkbox' name='logWeblog' " + String(cfg.logWeblog ? "checked" : "") + "> Weblog (50 Einträge)</label>";
+  chunk += "<label><input type='checkbox' name='logSyslog' " + String(cfg.logSyslog ? "checked" : "") + "> Syslog</label>";
+  chunk += "<label>Syslog Server:<br><input type='text' name='syslogServer' value='" + String(cfg.syslogServer) + "' maxlength='64' placeholder='192.168.1.100:514'></label>";
+  chunk += "<input type='submit' value='Logging Speichern'>";
+  chunk += "</fieldset></form></div></div>";
+
+  webServer.sendContent(chunk);
+  webServer.sendContent("");
+}
+
+// ═══════════════════════════════════════════════════════
+// TAB: System (dynamisch geladen)
+// ═══════════════════════════════════════════════════════
+void handleTabSystem() {
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "text/html", "");
+
+  String chunk = "";
+
+  // Uptime berechnen
+  unsigned long uptimeSeconds = millis() / 1000;
+  unsigned long days = uptimeSeconds / 86400;
+  unsigned long hours = (uptimeSeconds % 86400) / 3600;
+  unsigned long mins = (uptimeSeconds % 3600) / 60;
+  String uptimeStr = String(days) + "d " + String(hours) + "h " + String(mins) + "m";
+
+  // System
+  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  String ip = wifiOk ? WiFi.localIP().toString() : String("nicht verbunden");
+  long rssi = wifiOk ? WiFi.RSSI() : 0;
+
+  // Rohdaten auslesen
+  uint32_t freeHeap    = ESP.getFreeHeap();
+  uint32_t totalHeap   = 81920;
+  uint32_t usedHeap    = totalHeap - freeHeap;
+  uint32_t sketchSize  = ESP.getSketchSize();
+  uint32_t freeSketch  = ESP.getFreeSketchSpace();
+  uint32_t totalSketch = sketchSize + freeSketch;
+
+  // Prozente berechnen für Anzeige
+  uint8_t cpuUsedPct   = (uint8_t)(cpuUsage + 0.5f);
+  uint8_t ramUsedPct   = (uint8_t)((usedHeap * 100) / totalHeap);
+  uint8_t flashUsedPct = (uint8_t)((sketchSize * 100) / totalSketch);
+
+  // Strings für Anzeige
+  String ramUsedKB     = String(usedHeap / 1024) + " kB";
+  String ramFreeKB     = String(freeHeap / 1024) + " kB";
+  String ramTotalKB    = String(totalHeap / 1024) + " kB";
+  String flashUsedKB   = String(sketchSize / 1024) + " kB";
+  String flashFreeKB   = String(freeSketch / 1024) + " kB";
+  String flashTotalMB  = String(totalSketch / 1048576.0f, 1) + " MB";
+
+  // MQTT Status
+  String mqttStatusText = "";
+  String mqttStatusClass = "";
+  if (cfg.mqttActive) {
+    if (mqttStatus == MQTT_STATUS_CONNECTED) {
+      mqttStatusText = "Verbunden";
+      mqttStatusClass = "status-connected";
+    } else {
+      mqttStatusText = mqttLastError;
+      mqttStatusClass = "status-disconnected";
+    }
+  } else {
+    mqttStatusText = "Deaktiviert";
+    mqttStatusClass = "status-disabled";
+  }
+
+  // Chunk 13: TAB SYSTEM
+  chunk += "<div id='tab-system' class='tab-content active'><div class='preview-card'>";
+  chunk += "<fieldset><legend>Systemstatus</legend>";
+  chunk += "<table>";
+  chunk += "<tr><th>Parameter</th><th>Wert</th></tr>";
+  chunk += "<tr><td>Uptime</td><td>" + uptimeStr + "</td></tr>";
+  chunk += "<tr><td>IP-Adresse</td><td>" + ip + "</td></tr>";
+  chunk += "<tr><td>WLAN SSID</td><td>" + String(cfg.ssid) + "</td></tr>";
+  chunk += "<tr><td>RSSI</td><td>" + String(rssi) + " dBm</td></tr>";
+  chunk += "<tr><td>Chip ID</td><td>0x" + String(ESP.getChipId(), HEX) + "</td></tr>";
+  chunk += "<tr><td>CPU Frequenz</td><td>" + String(ESP.getCpuFreqMHz()) + " MHz</td></tr>";
+  chunk += "<tr><td>CPU-Last</td><td>" + createProgressBar(cpuUsedPct, String(cpuUsedPct) + "%", "", "") + "</td></tr>";
+  chunk += "<tr><td>RAM (" + ramTotalKB + ")</td><td>" + createProgressBar(ramUsedPct, String(ramUsedPct) + "%", ramUsedKB, ramFreeKB) + "</td></tr>";
+  chunk += "<tr><td>Flash (" + flashTotalMB + ")</td><td>" + createProgressBar(flashUsedPct, String(flashUsedPct) + "%", flashUsedKB, flashFreeKB) + "</td></tr>";
+  chunk += "<tr><td>MQTT</td><td><span class='" + mqttStatusClass + "'>" + mqttStatusText + "</span></td></tr>";
+  chunk += "</table></fieldset>";
+  webServer.sendContent(chunk);
+  chunk = "";
+
+  // Chunk 14: OTA Upload + JSON + Reset
+  chunk += "<fieldset><legend>Firmware Update (OTA)</legend>";
+  chunk += "<p style='font-size:12px;color:#666;margin-top:8px;'><em>ℹ️ Eine gültige .bin Datei auswählen!</em></p>";
+  chunk += "<form id='otaForm' method='POST' action='/update' enctype='multipart/form-data' onsubmit='return handleOTAUpload(event);'>";
+  chunk += "<input type='file' id='otaFile' name='update' accept='.bin' style='margin:10px 0;'>";
+  chunk += "<p></p>";
+  chunk += "<input type='submit' value='Firmware hochladen'>";
+  chunk += "</form>";
+  chunk += "<div id='otaProgress' style='display:none;margin-top:10px;'>";
+  chunk += "<div style='background:#e0e0e0;height:10px;border-radius:5px;overflow:hidden;'>";
+  chunk += "<div id='otaBar' style='height:100%;width:0%;transition:width 0.3s;line-height:30px;color:#fff;text-align:center;font-weight:bold;'></div>";
+  chunk += "</div>";
+  chunk += "<div id='otaText' style='margin-top:8px;text-align:center;font-size:14px;color:#333;'></div>";
+  chunk += "</div>";
+  chunk += "</fieldset>";
+  chunk += "<fieldset><legend>JSON-Daten</legend>";
+  chunk += "<p style='text-align:center;'><a href='/json' target='_blank' style='color:#6c5ce7;font-size:16px;text-decoration:none;'>📄 JSON-Daten anschauen</a></p>";
+  chunk += "</fieldset>";
+  chunk += "<fieldset><legend>System RESET</legend>";
+  chunk += "<p style='color:#c00;margin-bottom:12px;'><b>⚠️ Löscht alle Einstellungen - Neustart über AP (http://10.10.10.1)!</b></p>";
+  chunk += "<button class='btn-danger' onclick='if(confirm(\"Wirklich?\"))location.href=\"/eraseConfig\"'>🗑️ RESET</button>";
+  chunk += "</fieldset></div></div>";
+
+  webServer.sendContent(chunk);
+  webServer.sendContent("");
+}
+
+// ═══════════════════════════════════════════════════════
+// TAB: Logs (dynamisch geladen - IMMER FRISCH!)
+// ═══════════════════════════════════════════════════════
+void handleTabLogs() {
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "text/html", "");
+
+  String chunk = "";
+
+  // Chunk 15: TAB LOGS
+  chunk += "<div id='tab-logs' class='tab-content active'>";
+  hasNewLogs = false;  // Flag zurücksetzen nach Abruf
+  chunk += "<div class='preview-card'><fieldset><legend>Logs</legend>";
+  chunk += "<div style='text-align:center;margin-bottom:15px;'>";
+  chunk += "<button onclick='showTab(\"logs\",document.querySelector(\".nav-tabs a:nth-child(4)\"))'>🔄 Aktualisieren</button>";
+  chunk += "</div>";
+
+  if (!cfg.logWeblog) {
+    chunk += "<p style='text-align:center;color:#c00;margin:40px 0;'><b>[WEBLOG DEAKTIVIERT]</b></p>";
+    chunk += "<p style='text-align:center;color:#666;'>In Einstellungen aktivieren</p>";
+  } else {
+    chunk += "<table><tr><th>Zeit</th><th>Level</th><th>Nachricht</th></tr>";
+    webServer.sendContent(chunk);
+    chunk = "";
+
+    // Logs einzeln senden
+    for (int i = 0; i < logCount; i++) {
+      int idx = (logIndex - 1 - i + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
+      LogEntry& entry = logBuffer[idx];
+
+      time_t t = entry.timestamp;
+      struct tm* tm_info = localtime(&t);
+      char timeStr[20];
+      if (tm_info) {
+        strftime(timeStr, sizeof(timeStr), "%d.%m. %H:%M:%S", tm_info);
+      } else {
+        strcpy(timeStr, "??:??:??");
+      }
+
+      const char* levelStr[] = {"INFO", "WARN", "ERROR"};
+      const char* levelClass[] = {"log-info", "log-warn", "log-error"};
+
+      chunk += "<tr>";
+      chunk += "<td class='timestamp'>" + String(timeStr) + "</td>";
+      chunk += "<td class='" + String(levelClass[entry.level]) + "'>" + String(levelStr[entry.level]) + "</td>";
+      chunk += "<td>" + String(getText(entry.msgIndex)) + "</td>";
+      chunk += "</tr>";
+
+      // Alle 5 Zeilen senden
+      if (i % 5 == 4 || i == logCount - 1) {
+        webServer.sendContent(chunk);
+        chunk = "";
+      }
+    }
+
+    chunk += "</table>";
+    chunk += "<p style='text-align:center;color:#666;font-size:11px;margin-top:20px;'>ℹ️ Zeige " + String(logCount) + " von max. " + String(LOG_BUFFER_SIZE) + "</p>";
+  }
+
+  chunk += "</fieldset></div></div>";
+  webServer.sendContent(chunk);
+  webServer.sendContent("");
+}
+
+// Alte Handler leiten auf Root um (Single-Page-App)
+void handleMQTTPage() {
+  handleRoot();
+}
+
+void handleSystemPage() {
+  handleRoot();
+}
+
+void handleLogPage() {
+  handleRoot();
+}
+
+
+
+// ═══════════════════════════════════════════════════════
+// Save-Handler für Formulare
+// ═══════════════════════════════════════════════════════
+
+void handleSaveMqtt() {
+  cfg.mqttActive = webServer.hasArg("active") ? 1 : 0;
+
+  if (webServer.hasArg("broker")) {
+    String broker = webServer.arg("broker");
+    memset(cfg.mqttBroker, 0, sizeof(cfg.mqttBroker));
+    broker.toCharArray(cfg.mqttBroker, sizeof(cfg.mqttBroker));
+  } else {
+    cfg.mqttBroker[0] = '\0';
+  }
+
+  if (webServer.hasArg("user")) {
+    String user = webServer.arg("user");
+    memset(cfg.mqttUser, 0, sizeof(cfg.mqttUser));
+    user.toCharArray(cfg.mqttUser, sizeof(cfg.mqttUser));
+  }
+
+  if (webServer.hasArg("pass")) {
+    String pass = webServer.arg("pass");
+    memset(cfg.mqttPass, 0, sizeof(cfg.mqttPass));
+    pass.toCharArray(cfg.mqttPass, sizeof(cfg.mqttPass));
+  }
+
+  // MQTT Parameter
+  for (int i = 0; i < 7; i++) {
+    String sendKey = "send" + String(i);
+    String retKey = "ret" + String(i);
+    
+    bool hasSend = webServer.hasArg(sendKey);
+    bool hasRetain = webServer.hasArg(retKey);
+    
+    if (!hasSend) {
+      cfg.mqttParams[i] = 0;
+    } else if (hasRetain) {
+      cfg.mqttParams[i] = 2;
+    } else {
+      cfg.mqttParams[i] = 1;
+    }
+  }
+
+  bool sendDiscovery = webServer.hasArg("haosDiscovery");
+
+  cfgSave();
+  logMessage(LOG_INFO, MSG_MQTT_SAVED);
+
+  // HAOS Discovery ausführen wenn Checkbox gesetzt
+  if (sendDiscovery && cfg.mqttActive) {
+    sendHAOSDiscovery();
+  }
+
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleSaveLocation() {
+  if (webServer.hasArg("alt")) {
+    cfg.altitude = webServer.arg("alt").toFloat();
+  }
+  if (webServer.hasArg("lat")) {
+    cfg.latitude = webServer.arg("lat").toFloat();
+  }
+  if (webServer.hasArg("lon")) {
+    cfg.longitude = webServer.arg("lon").toFloat();
+  }
+
+  cfgSave();
+  logMessage(LOG_INFO, MSG_LOCATION_SAVED);
+  
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleSaveLogging() {
+  cfg.logWeblog = webServer.hasArg("logWeblog") ? 1 : 0;
+  cfg.logSyslog = webServer.hasArg("logSyslog") ? 1 : 0;
+  cfg.logMqtt = webServer.hasArg("logMqtt") ? 1 : 0;
+  
+  if (webServer.hasArg("syslogServer")) {
+    String syslog = webServer.arg("syslogServer");
+    memset(cfg.syslogServer, 0, sizeof(cfg.syslogServer));
+    syslog.toCharArray(cfg.syslogServer, sizeof(cfg.syslogServer));
+  }
+
+  cfgSave();
+  logMessage(LOG_INFO, MSG_LOGGING_SAVED);
+  
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.send(200, "application/json", "{\"success\":true}");
+}
+
+
+void handleSaveWifi() {
+  if (webServer.hasArg("ssid")) {
+    String ssid = webServer.arg("ssid");
+    memset(cfg.ssid, 0, sizeof(cfg.ssid));
+    ssid.toCharArray(cfg.ssid, sizeof(cfg.ssid));
+  } else {
+    cfg.ssid[0] = '\0';
+  }
+  
+  if (webServer.hasArg("pass")) {
+    String pass = webServer.arg("pass");
+    memset(cfg.pass, 0, sizeof(cfg.pass));
+    pass.toCharArray(cfg.pass, sizeof(cfg.pass));
+  } else {
+    cfg.pass[0] = '\0';
+  }
+  
+  cfgSave();
+  logMessage(LOG_INFO, MSG_WIFI_SAVED);
+  
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<title>Gespeichert</title>";
+  html += "<style>body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#f5f5f7;text-align:center;}h1{color:#6c5ce7;}</style>";
+  html += "</head><body>";
+  html += "<h1>✅ WLAN gespeichert!</h1>";
+  
+  if (cfg.ssid[0] == '\0') {
+    html += "<p>ESP startet neu im AP-Modus...</p>";
+  } else {
+    html += "<p>ESP startet neu und verbindet sich mit: " + String(cfg.ssid) + "</p>";
+  }
+  
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
+  
+  delay(2000);
+  ESP.restart();
+}
+
+// ═══════════════════════════════════════════════════════
+// OTA Web-Upload Handler
+// ═══════════════════════════════════════════════════════
+void handleUpdate() {
+  HTTPUpload& upload = webServer.upload();
+  
+  if (upload.status == UPLOAD_FILE_START) {
+    logMessage(LOG_INFO, MSG_OTA_START);
+    uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    if (!Update.begin(maxSketchSpace)) {
+      logMessage(LOG_ERROR, MSG_OTA_ERROR);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      logMessage(LOG_ERROR, MSG_OTA_ERROR);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      logMessage(LOG_INFO, MSG_OTA_DONE);
+    } else {
+      logMessage(LOG_ERROR, MSG_OTA_ERROR);
+    }
+  }
+}
+void handleUpdateDone() {
+  if (Update.hasError()) {
+    webServer.send(200, "text/plain", "Update FEHLGESCHLAGEN!");
+  } else {
+    webServer.send(200, "text/plain", "Update ERFOLGREICH! ESP startet neu...");
+    delay(1000);
+    ESP.restart();
+  }
+}
+// ═══════════════════════════════════════════════════════
+// JSON Handler mit ArduinoJson
+// ═══════════════════════════════════════════════════════
+void handleJSON() {
+  float temp  = bme.readTemperature();
+  float hum   = bme.readHumidity();
+  float press = bme.readPressure() / 100.0f;
+  float dew   = dewPoint(temp, hum);
+  int trend   = calcBaroTrend();
+  int warning = calculateWeatherWarning(temp, hum, dew, trend);
+
+  String ts = utcTimeISO8601();
+
+  // JSON Dokument erstellen (Größe anpassen wenn nötig)
+  StaticJsonDocument<1024> doc;
+
+  doc["timestamp"] = ts;
+
+JsonObject temperature = doc.createNestedObject("temperature");
+  if (isnan(temp)) {
+    temperature["value"] = nullptr;  // → wird zu "null" im JSON
+  } else {
+    temperature["value"] = serialized(String(temp, 2));
+  }
+  temperature["unit"] = "°C";
+
+  JsonObject humidity = doc.createNestedObject("humidity");
+  if (isnan(hum)) {
+    humidity["value"] = nullptr;
+  } else {
+    humidity["value"] = serialized(String(hum, 2));
+  }
+  humidity["unit"] = "%";
+
+  JsonObject pressure = doc.createNestedObject("pressure");
+  if (isnan(press)) {
+    pressure["value"] = nullptr;
+  } else {
+    pressure["value"] = serialized(String(press, 2));
+  }
+  pressure["unit"] = "hPa";
+
+  // ✅ NEU: Durchschnittswerte hinzufügen
+  JsonObject pressureAvg = doc.createNestedObject("pressureAvg");
+  pressureAvg["current"] = !isnan(currentHourlyValue) ? currentHourlyValue : 0.0;
+  pressureAvg["minus1h"] = !isnan(hourlyValue_minus1) ? hourlyValue_minus1 : 0.0;
+  pressureAvg["minus2h"] = !isnan(hourlyValue_minus2) ? hourlyValue_minus2 : 0.0;
+  pressureAvg["unit"] = "hPa";
+
+  JsonObject barometer = doc.createNestedObject("barometer");
+  barometer["value"] = trend;
+  barometer["unit"] = "level";
+  barometer["range"] = "-3 to +3";
+
+  JsonObject dewpoint = doc.createNestedObject("dewpoint");
+  if (isnan(dew)) {
+    dewpoint["value"] = nullptr;
+  } else {
+    dewpoint["value"] = serialized(String(dew, 2));
+  }
+  dewpoint["unit"] = "°C";
+
+  JsonObject warningObj = doc.createNestedObject("warning");
+  warningObj["value"] = warning;
+  warningObj["text"] = getWarningText(warning);
+
+  JsonObject location = doc.createNestedObject("location");
+  location["latitude"] = serialized(String(cfg.latitude, 6));
+  location["longitude"] = serialized(String(cfg.longitude, 6));
+  
+  JsonObject altitude = location.createNestedObject("altitude");
+  altitude["value"] = serialized(String(cfg.altitude, 1));
+  altitude["unit"] = "m";
+
+  // JSON als String serialisieren (schön formatiert)
+  String output;
+  serializeJsonPretty(doc, output);
+
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.send(200, "application/json", output);
+}
+
+// ═══════════════════════════════════════════════════════
+// EEPROM Reset Handler
+// ═══════════════════════════════════════════════════════
+void handleEraseConfig() {
+  cfgEraseAll();
+  logMessage(LOG_INFO, MSG_EEPROM_ERASED);
+  webServer.send(200, "text/plain", "EEPROM gelöscht. Neustart...");
+  delay(1000);
+  ESP.restart();
+}
+
+// ═══════════════════════════════════════════════════════
+// ALT: handleMQTT() - für Kompatibilität
+// ═══════════════════════════════════════════════════════
+void handleMQTT() {
+  handleRoot();
+}
+
+// ═══════════════════════════════════════════════════════
+// Setup
+// ═══════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\n=== ESP-BME280 START ===");
+  Serial.print("Config Size: ");
+  Serial.println(sizeof(Config));
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+    
+  EEPROM.begin(EEPROM_SIZE);
+  
+  Wire.begin(SDA_PIN, SCL_PIN);
+  bme.begin(0x76);
+
+  // Config laden oder Defaults
+  if (!cfgLoad()) {
+    Serial.println("⚠️ Keine gültige Config → Defaults setzen");
+    cfgSetDefaults();
+    cfgSave();
+  }
+
+  logMessage(LOG_INFO, MSG_SYSTEM_START);
+
+  // WLAN oder AP?
+  if (cfg.ssid[0] == '\0') {
+    Serial.println("📡 Keine SSID → AP-Modus");
+    startAccessPoint();
+  } else {
+    if (!connectToWiFi()) {
+      Serial.println("❌ WLAN fehlgeschlagen → AP-Modus");
+      startAccessPoint();
+    } else {
+      setupTime();
+      
+      // mDNS starten
+      if (MDNS.begin("wetter-freund")) {
+        Serial.println("✅ mDNS gestartet: http://wetter-freund.local");
+        MDNS.addService("http", "tcp", 80);
+      } else {
+        Serial.println("❌ mDNS Start fehlgeschlagen!");
+      }
+      
+      setupOTA();
+      connectMQTT();
+    }
+  }
+
+  // Webserver Routes
+  webServer.on("/", handleRoot);
+  webServer.on("/tab/daten", handleTabDaten);
+  webServer.on("/tab/einstellungen", handleTabEinstellungen);
+  webServer.on("/tab/system", handleTabSystem);
+  webServer.on("/tab/logs", handleTabLogs);
+  webServer.on("/mqtt",   HTTP_GET,  handleMQTTPage);
+  webServer.on("/mqtt",   HTTP_POST, handleMQTT);
+  webServer.on("/json",   HTTP_GET,  handleJSON);
+  webServer.on("/system", HTTP_GET,  handleSystemPage);
+  webServer.on("/eraseConfig", handleEraseConfig);
+  webServer.on("/log",    HTTP_GET,  handleLogPage);
+  webServer.on("/api/mqtt-status", HTTP_GET, handleMQTTStatus);
+  webServer.on("/api/log-status", HTTP_GET, handleLogStatus);
+  webServer.on("/update", HTTP_POST, handleUpdateDone, handleUpdate);
+  webServer.on("/saveMqtt", HTTP_POST, handleSaveMqtt);
+  webServer.on("/saveWifi", HTTP_POST, handleSaveWifi);  // ← NEU!
+  webServer.on("/saveLocation", HTTP_POST, handleSaveLocation);
+  webServer.on("/saveLogging", HTTP_POST, handleSaveLogging);
+
+  webServer.begin();
+  logMessage(LOG_INFO, MSG_WEBSERVER_START);
+  
+  Serial.println("✅ System bereit!");
+  if (WiFi.getMode() == WIFI_AP) {
+    Serial.println("📡 WebUI: http://10.10.10.1");
+  } else {
+    Serial.println("📡 WebUI: http://" + WiFi.localIP().toString());
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// Loop
+// ═══════════════════════════════════════════════════════
+unsigned long lastMQTT = 0;
+unsigned long lastBaroUpdate = 0;
+
+void loop() {
+  // 🚨 NOTFALL-TASTER: EEPROM löschen + AP-Modus
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    cfgEraseAll();
+    delay(500);
+    ESP.restart();
+  }
+  
+  updateCPUUsage();
+  webServer.handleClient();
+  
+  ArduinoOTA.handle();
+  MDNS.update();
+
+  if (millis() - lastBaroUpdate > 5000UL || lastBaroUpdate == 0) {
+    float press = bme.readPressure() / 100.0f;
+    updateBarometer(press);
+    lastBaroUpdate = millis();
+  }
+
+  if (cfg.mqttActive) {
+    if (mqttStatus != MQTT_STATUS_CONNECTED) {
+      connectMQTT();
+    }
+    
+    if (mqttStatus == MQTT_STATUS_CONNECTED) {
+      mqtt.loop();
+      
+      if (millis() - lastMQTT > 60000UL) {
+        publishMQTT();
+        lastMQTT = millis();
+      }
+    }
+  }
+  delay(LOOP_DELAY);
+}
