@@ -43,7 +43,7 @@ Startet die Reise in meinem [WIKI](https://github.com/dummbold/Wetter-Freund/wik
 
 <img width="132" height="640" alt="Mittel (IMG_6360)" src="https://github.com/user-attachments/assets/89f77783-901f-42d4-9832-178670cc8f23" />
 <img width="97" height="640" alt="Mittel (IMG_6358)" src="https://github.com/user-attachments/assets/0850bbbe-79b4-4818-9133-7665d2f7a9de" />
-<img width="140" height="640" alt="Mittel (IMG_6362)" src="https://github.com/user-attachments/assets/32fc687c-3b4c-42ee-9fa3-64b4143f6fa6" />
+<img width="140" height="640" alt="Mittel (IMG_6362)" src="https://github.com/user-attachments/assets/85f34237-afa4-42a4-a11c-c92a34fcab54" />
 <img width="109" height="320" alt="Mittel (IMG_6364)" src="https://github.com/user-attachments/assets/f0c0e6ee-dbd6-4361-817a-86c94dd947f3" />
 
 
