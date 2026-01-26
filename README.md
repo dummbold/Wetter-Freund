@@ -3,9 +3,9 @@
 🇺🇸🇬🇧🇫🇷🇪🇸🇮🇹🇪🇺🇺🇦🇦🇺🇫🇮🇨🇿🇧🇷🇨🇦🇰🇿🇨🇴🇲🇶🇳🇬🇸🇨🇪🇭🇺🇾🇺🇬🏳️🏴‍☠️
 >
 >_International users:
->This Text is written in german language. Please use your Browsers translation feature to read it in your language. A translation from german into other languages mainly generates better results then a translation from any language into german. Thanks for your compliance._
+>This Text is intentionally written in german language. Please use your Browsers translation feature to read it in your language. A translation from german into other languages mainly generates better results then a translation from any language into german, due to specific linguistic characteristics of the german language. Thanks for your compliance._
 >
->_I will place only the german Version of the software in the repo. Please feel free to generate a Software version in your language and contact me to place your language Version here. A mulitlanguage-Version is not possible on the little ESP-02S - it will run out of Memory. But you can just drop the code into GPT and kindly ask for a translation._
+>_I will actually place only the german Version of the software in the repo. Please feel free to generate a Software version in your language and contact me to place your language Version here. A mulitlanguage-version is planned for the next update. By now you can just drop the code into GPT and kindly ask for a translation._
 
 # Wetter•Freund
 
@@ -31,7 +31,6 @@ Der Wetter•Freund ist eine DIY-Wetterstation mit ESP und Arduino. Gebt nicht 1
 - JSON
 - RESET
 - Automatisierte Anbindung an HomeAssistant über MQTT
-- Integration für HomeAssistant ist in Arbeit ...
 
 ### Was er nicht kann:
 - KEINE nutzlose oder unbenutzbare Spionageapp!
@@ -40,5 +39,12 @@ Der Wetter•Freund ist eine DIY-Wetterstation mit ESP und Arduino. Gebt nicht 1
   
 Startet die Reise in meinem [WIKI](https://github.com/dummbold/Wetter-Freund/wiki)
 
-‼️ ACHTUNG: Version 2.0 ist jetzt online mit tollem modernem UI - vollständig responive‼️
+‼️ ACHTUNG: Version 2.0 ist jetzt online mit tollem modernem UI - vollständig responive. Hier ein kleiner Prewiew vom Smartphone:
+
+<img width="97" height="640" alt="Mittel (IMG_6358)" src="https://github.com/user-attachments/assets/0850bbbe-79b4-4818-9133-7665d2f7a9de" />
+<img width="218" height="640" alt="Mittel (IMG_6364)" src="https://github.com/user-attachments/assets/f0c0e6ee-dbd6-4361-817a-86c94dd947f3" />
+<img width="140" height="640" alt="Mittel (IMG_6362)" src="https://github.com/user-attachments/assets/32fc687c-3b4c-42ee-9fa3-64b4143f6fa6" />
+<img width="132" height="640" alt="Mittel (IMG_6360)" src="https://github.com/user-attachments/assets/89f77783-901f-42d4-9832-178670cc8f23" />
+
+
 
