@@ -2,10 +2,11 @@
 
 🇺🇸🇬🇧🇫🇷🇪🇸🇮🇹🇪🇺🇺🇦🇦🇺🇫🇮🇨🇿🇧🇷🇨🇦🇰🇿🇨🇴🇲🇶🇳🇬🇸🇨🇪🇭🇺🇾🇺🇬🏳️🏴‍☠️
 >
->_International users:
->This Text is intentionally written in german language. Please use your Browsers translation feature to read it in your language. A translation from german into other languages mainly generates better results then a translation from any language (especially english) into german, due to specific linguistic characteristics of the german language. Thanks for your compliance._
+>_International users:_
 >
->_I will actually place only the german Version of the software in the repo. Please feel free to generate a Software version in your language and contact me to place your language Version here. A mulitlanguage-version is planned for the next update. By now you can just drop the code into GPT and kindly ask for a translation._
+>_This text is intentionally written in german language. Please use your browsers translation feature to read it in your language. A translation from german into other languages mainly generates better results then a translation from any language (especially english) into german, due to specific linguistic characteristics of the german language. Thanks for your compliance._
+>
+>_I will actually place only the german language version of the software in the repo. Please feel free to generate a software version in your language and contact me to place your language version in the repo. A mulitlanguage-version is planned for the next update. By now you can just drop the code into GPT and kindly ask for a translation._
 
 # Wetter•Freund
 
