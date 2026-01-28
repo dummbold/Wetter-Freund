@@ -44,7 +44,7 @@ Der Wetter•Freund ist eine DIY-Wetterstation mit ESP und Arduino. Gebt nicht 1
   
 Startet die Reise in meinem [WIKI](https://github.com/dummbold/Wetter-Freund/wiki)
 
-‼️ ACHTUNG: Version 2.0 ist jetzt online mit tollem modernem UI - vollständig responive. Hier ein kleiner Prewiew vom Smartphone:
+‼️ ACHTUNG: Version 2.0 ist jetzt online mit tollem modernem UI - 100% responsive. Hier ein kleiner Prewiew vom Smartphone:
 
 <img width="132" height="640" alt="Mittel (IMG_6360)" src="https://github.com/user-attachments/assets/89f77783-901f-42d4-9832-178670cc8f23" />
 <img width="97" height="640" alt="Mittel (IMG_6358)" src="https://github.com/user-attachments/assets/0850bbbe-79b4-4818-9133-7665d2f7a9de" />
